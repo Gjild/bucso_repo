@@ -1,0 +1,27 @@
+[project]
+name = "bucso"
+version = "0.1.0"
+description = "Dual-conversion BUC spur optimization tool"
+readme = "README.md"
+requires-python = ">=3.13"
+
+dependencies = [
+  "pydantic>=2.9",
+  "pydantic-settings>=2.5",
+  "pyyaml>=6.0.2",
+  "typer>=0.12",
+  "rich>=13.8",
+  "numpy>=2.1",
+  "pandas>=2.2",
+  "scipy>=1.14",
+  "jinja2>=3.1",
+  "pytest>=8.4.2",
+]
+
+[project.scripts]
+bucso = "bucso.cli:app"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
