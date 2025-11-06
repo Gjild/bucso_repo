@@ -547,7 +547,7 @@ def main() -> None:
             "out",
             "site",
             "KaBUC_SpurPlan.egg-info",
-            "tests"
+            "tests_hide"
         ]
         uv_files = [
             "uv.lock",
@@ -558,7 +558,7 @@ def main() -> None:
             "project_tree.py",
             "project_tree_out.json",
             "restore_from_project_tree.py",
-            "codebase.json"
+            "codebase.json",
         ]
         exclude_dirs.extend(normalize_patterns(uv_dirs, case_insensitive=args.ignore_case))
         exclude_files.extend(normalize_patterns(uv_files, case_insensitive=args.ignore_case))

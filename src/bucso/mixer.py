@@ -11,6 +11,12 @@ def _bilinear_clamped(z: np.ndarray, x_axis: np.ndarray, y_axis: np.ndarray, x: 
     Bilinear interpolation over a rect grid with clamp-at-edges behavior.
     z shape must be (len(x_axis), len(y_axis)) in the same orientation used in the YAML.
     """
+    # Validate shape early to avoid silent mis-indexing
+    if z.shape != (len(x_axis), len(y_axis)):
+        raise ValueError(
+            f"Mixer spur grid shape {z.shape} does not match axes "
+            f"({len(x_axis)}, {len(y_axis)}). Check YAML grids."
+        )
     # map value->index space (scalar)
     xi = np.interp(x, x_axis, np.arange(len(x_axis)))
     yi = np.interp(y, y_axis, np.arange(len(y_axis)))
@@ -45,21 +51,24 @@ class Mixer:
         self._grids_by_order: Dict[str, Dict[str, np.ndarray]] = {}
         if "grids_by_order" in st and isinstance(st["grids_by_order"], dict):
             for key, g in st["grids_by_order"].items():
-                self._grids_by_order[str(key)] = {
-                    "lo": np.array((g.get("lo_hz") or []), float),
-                    "if": np.array((g.get("if_hz") or []), float),
-                    "rej": np.array((g.get("rej_dbc") or []), float),
-                }
+                lo = np.array((g.get("lo_hz") or []), float)
+                ifv = np.array((g.get("if_hz") or []), float)
+                rej = np.array((g.get("rej_dbc") or []), float)
+                if rej.ndim != 2:
+                    raise ValueError(f"Mixer '{mdl.name}' per-order grid rej_dbc must be 2D; got shape {rej.shape}.")
+                # shape validation will be re-checked in _bilinear_clamped
+                self._grids_by_order[str(key)] = {"lo": lo, "if": ifv, "rej": rej}
 
         # Legacy: a single grid interpreted as the (1,1) grid.
         self._grid_default = None
         if "grids" in st and isinstance(st["grids"], dict):
             g = st["grids"]
-            self._grid_default = {
-                "lo": np.array((g.get("lo_hz") or []), float),
-                "if": np.array((g.get("if_hz") or []), float),
-                "rej": np.array((g.get("rej_dbc") or []), float),
-            }
+            lo = np.array((g.get("lo_hz") or []), float)
+            ifv = np.array((g.get("if_hz") or []), float)
+            rej = np.array((g.get("rej_dbc") or []), float)
+            if rej.size and (rej.ndim != 2):
+                raise ValueError(f"Mixer '{mdl.name}' legacy grid rej_dbc must be 2D; got shape {rej.shape}.")
+            self._grid_default = {"lo": lo, "if": ifv, "rej": rej}
 
         # Scalar entries
         self._entries = st.get("entries", []) or []
@@ -74,7 +83,7 @@ class Mixer:
     def clear_cache(self):
         self._rej_cached.cache_clear()
 
-    @lru_cache(maxsize=65536)
+    @lru_cache(maxsize=262144)
     def _rej_cached(self, m: int, n: int, lo_q: float, if_q: float) -> float:
         # 1) Exact scalar entry wins
         for e in self._entries:

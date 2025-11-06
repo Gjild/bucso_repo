@@ -40,6 +40,9 @@ class MaskSpec(BaseModel):
     default_dbc: dB = -60.0
     # safer than a bare [] default
     table: List[MaskTableEntry] = Field(default_factory=list)
+    # NEW: how to interpret table for OOB: "absolute" (abs freq) or "edge_relative" (offset from RF-band edge)
+    # For inband masks this field is ignored.
+    mode: str = "absolute"
 
 
 class Masks(BaseModel):
@@ -62,6 +65,10 @@ class Orders(BaseModel):
 class Constraints(BaseModel):
     enforce_desired_mn11_only: bool = True
     guard_margin_db: dB = 2.0
+    # Optional sign locks for the desired mechanism:
+    # +1 = "sum / high-side", -1 = "difference / low-side"
+    desired_stage1_sign: int | None = None
+    desired_stage2_sign: int | None = None
 
 
 class EarlyReject(BaseModel):
@@ -89,6 +96,21 @@ class Search(BaseModel):
     mixer2_candidates: List[str]
     rf_bpf_choices: List[str]
     if2_filter_model: str
+
+    # -------- NEW (fast snapped LO search) --------
+    # Defaults preserve current behavior but enable the fast path out of the box.
+    enable_snapped_lo_search: bool = True             # set False to force legacy wide sweeps
+    lo_snap_window_steps: int = 2                     # initial ±N around snap
+    lo_snap_expand_schedule: List[int] = [2, 4, 8]    # widening schedule if empty
+    lo_snap_max_window_steps: int = 8                 # hard cap for widening
+    include_lo2_alt_form: bool = False                # also try s2*(-RFc - IF2c)
+
+    # Optional: cheaper search (winner is re-scored at full orders for parity)
+    search_orders_mn_abs: int | None = None           # e.g., 3 or 4
+    search_cross_sum_max: int | None = None           # e.g., 8..10
+
+    # Optional: cap per-LO candidate list before Cartesian pairing
+    per_lo_candidate_cap: int | None = 128
 
 
 class Config(BaseModel):
@@ -152,6 +174,8 @@ class PfdComponent(BaseModel):
     k: int
     base_rel_dBc: dB
     rolloff_dB_per_dec: float
+    # NEW: optional corner to express roll-off vs (k*fPFD / corner_hz)
+    corner_hz: Optional[Hz] = None
 
 
 class PfdFamily(BaseModel):

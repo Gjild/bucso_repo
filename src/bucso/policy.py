@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Callable, Optional, Tuple
 import os, yaml, math, hashlib, importlib.metadata
+from contextlib import contextmanager
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -12,6 +13,119 @@ from .synth import Synth
 from .tiling import make_tiles
 from .spur import enumerate_spurs, desired_paths
 from .utils import Band
+
+# ------------------- process-global model cache -------------------
+_MODELS: dict | None = None  # set by _init_models_once()
+
+
+def _file_hash(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_yaml(root: str, name_or_path: str):
+    path = name_or_path if os.path.isabs(name_or_path) else os.path.join(root, name_or_path)
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def _init_models_once(models_dir: str, cfg_dict: dict):
+    """
+    Process initializer: load heavy models only once per process and stash
+    them in module globals to avoid per-tile I/O/parse overhead.
+    Also sets mixer cache quantization for better hit rate.
+    """
+    global _MODELS
+    if _MODELS is not None:
+        return
+
+    cfg = Config(**cfg_dict)
+
+    # Load mixer models (construct Mixer objects)
+    mixer1 = [Mixer(MixerModel(**_load_yaml(models_dir, p))) for p in cfg.search.mixer1_candidates]
+    mixer2 = [Mixer(MixerModel(**_load_yaml(models_dir, p))) for p in cfg.search.mixer2_candidates]
+    # Improve cache reuse (quantize lookups more coarsely, clear LRUs)
+    for m in (mixer1 + mixer2):
+        m.set_cache_quantum_hz(5e6)  # ~5 MHz; good vs 25–250 MHz grids
+        m.clear_cache()
+
+    # Load synthesizers
+    lo1s = [Synth(LOMdl(**_load_yaml(models_dir, p))) for p in cfg.search.lo1_candidates]
+    lo2s = [Synth(LOMdl(**_load_yaml(models_dir, p))) for p in cfg.search.lo2_candidates]
+
+    # RF filters (CSV/YAML auto)
+    rfs = []
+    for rp in cfg.search.rf_bpf_choices:
+        path = rp if os.path.isabs(rp) else os.path.join(models_dir, rp)
+        rfs.append(RFBPF.from_path(path))
+
+    # IF2 parametric YAML (constants)
+    if2yaml = _load_yaml(models_dir, cfg.search.if2_filter_model)
+
+    _MODELS = dict(
+        cfg_dict=cfg_dict,
+        mixer1=mixer1,
+        mixer2=mixer2,
+        lo1s=lo1s,
+        lo2s=lo2s,
+        rfs=rfs,
+        if2yaml=if2yaml,
+        models_dir=models_dir,
+    )
+
+
+@contextmanager
+def _progress_ctx(total: int, desc: str, provided_cb: Optional[Callable[[int], None]]):
+    """
+    Yield a callable `update(n)` that advances progress by n.
+    If `provided_cb` is given, we just yield that.
+    Otherwise, we enable a Rich progress bar when BUCSO_PROGRESS is truthy.
+    Fallback to a no-op if Rich isn't available or progress is disabled.
+    """
+    if provided_cb is not None:
+        # External progress handler (e.g., CLI) – just forward updates
+        yield provided_cb
+        return
+
+    use_env = os.getenv("BUCSO_PROGRESS", "").strip().lower()
+    enabled = use_env in ("1", "true", "yes", "on", "y", "t")
+
+    if not enabled:
+        # No progress – return a no-op updater
+        def _noop(_n: int) -> None:
+            pass
+        yield _noop
+        return
+
+    try:
+        from rich.progress import (
+            Progress, BarColumn, TimeElapsedColumn, TimeRemainingColumn,
+            MofNCompleteColumn, SpinnerColumn
+        )
+        columns = (
+            SpinnerColumn(),
+            f"[bold]{desc}[/bold]",
+            BarColumn(bar_width=None),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+        )
+        with Progress(*columns) as progress:
+            task_id = progress.add_task(desc, total=total)
+
+            def _update(n: int) -> None:
+                if n:
+                    progress.update(task_id, advance=int(n))
+
+            yield _update
+    except Exception:
+        # Graceful fallback
+        def _noop(_n: int) -> None:
+            pass
+        yield _noop
 
 
 @dataclass
@@ -41,18 +155,6 @@ class PlanRow:
     desired_stage1_sign: int
     desired_stage2_sign: int
 
-
-def _load_yaml(root: str, name_or_path: str):
-    path = name_or_path if os.path.isabs(name_or_path) else os.path.join(root, name_or_path)
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
-
-def _file_hash(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 def _overlap_1d(a_center: float, a_bw: float, b_center: float, b_bw: float) -> bool:
     a_lo = a_center - a_bw / 2.0
@@ -86,6 +188,10 @@ def _early_reject_gate(
     # Desired bands for equivalence tests
     if2_des, rf_des = desired_paths(tile_if1, lo1_hz, lo2_hz, inj1, s2)
 
+    # quick desired-IF2 containment precheck to avoid wasting work
+    if not if2.contains_desired(if2_des.center_hz, if2_des.bw_hz):
+        return True
+
     # Stage-1 images (sum & diff) against IF2 passband — don't reject if it's the desired path
     if cfg.early_reject.image_in_if2_passband:
         for sgn in (+1, -1):
@@ -111,20 +217,116 @@ def _early_reject_gate(
                     if not (is_desired or is_desired_equiv):
                         return True
 
+    # LO2 feedthrough / quick harmonics in RF passband (cheap reject)
+    if cfg.early_reject.loft_in_if2_or_rf_passbands:
+        # main tone
+        if _overlap_1d(lo2_hz, 0.0, rf_des.center_hz, rf_des.bw_hz):
+            return True
+        # quick harmonic screen — include k=2,3,4 (very cheap)
+        for k in (2, 3, 4):
+            f_h = k * lo2_hz
+            if _overlap_1d(f_h, 0.0, rf_des.center_hz, rf_des.bw_hz):
+                return True
+
     return False
 
 
 # --- Helpers -------------------------------------------------------------
 
 def _rf_band_ok(rf_filter: RFBPF, rf_band_center: float, rf_bw: float, max_il_db: float = 3.0) -> bool:
-    """Require the desired RF band (center ± BW/2) to be inside the passband by IL >= -max_il_db."""
+    """Require the desired RF band (center ± BW/2) to be inside the passband by IL >= -max_il_db.
+    Sample densely across the band to avoid optimistic passes."""
     half = rf_bw * 0.5
-    fs = (rf_band_center - half, rf_band_center, rf_band_center + half)
-    attn = [float(rf_filter.attn_at(f)) for f in fs]
-    return min(attn) >= -max_il_db
+    fs = np.linspace(rf_band_center - half, rf_band_center + half, 17)
+    attn = np.array([float(rf_filter.attn_at(f)) for f in fs], float)
+    return np.min(attn) >= -max_il_db
 
 
-# --- IF2 refinement (deterministic coordinate descent) ------------------------
+# --- fast snapped LO neighborhoods ---------------------------------------
+
+def _neighborhood_solutions(
+    synth: Synth, *,
+    f_targets: list[float],
+    path: str,
+    drive_min: float,
+    drive_max: float,
+    base_N: int,
+    expand_sched: list[int],
+    hard_max: int,
+    cap: int | None,
+    bw_hz_for_fallback: float,
+):
+    """
+    For each analytic target:
+      1) snap to legal grid and probe ±N grid steps
+      2) widen using expand_sched up to hard_max if needed
+      3) final fallback: bounded legacy legal_settings() within ±3×BW
+    Returns deterministic, de-duplicated LOSolution entries sorted by proximity.
+    """
+    step = float(synth.mdl.step_hz)
+
+    def _probe(N: int):
+        offsets = [0] + [off for k in range(1, max(0, N) + 1) for off in (k, -k)]
+        sols = []
+        for tgt in f_targets:
+            for off in offsets:
+                sol = synth.snap_to_legal(
+                    f_target=float(tgt + off * step),
+                    path=path,
+                    window_steps=0,
+                    drive_min_dbm=drive_min,
+                    drive_max_dbm=drive_max,
+                )
+                if sol is not None:
+                    sols.append(sol)
+
+        # Deterministic de-dup + sort by |f - nearest target|
+        def key(s): return (s.name, s.mode, s.divider, round(s.f_out_hz, 0))
+        dedup = {key(s): s for s in sols}
+        out = list(dedup.values())
+
+        def dist(s): return min(abs(s.f_out_hz - ft) for ft in f_targets)
+        out.sort(key=dist)
+
+        if cap is not None and len(out) > cap:
+            out = out[:cap]
+        return out
+
+    # Initial probe
+    sols = _probe(int(base_N))
+    if sols:
+        return sols
+
+    # Expand schedule
+    for N in (expand_sched or []):
+        N = int(min(max(0, N), hard_max))
+        sols = _probe(N)
+        if sols:
+            return sols
+
+    # Final bounded fallback (legacy semantics, but centered on targets)
+    sols = []
+    for tgt in f_targets:
+        fmin = max(1.0, float(tgt) - 3.0 * bw_hz_for_fallback)
+        fmax = float(tgt) + 3.0 * bw_hz_for_fallback
+        sols.extend(synth.legal_settings(
+            name_filter=None, f_min=fmin, f_max=fmax, path=path,
+            drive_min_dbm=drive_min, drive_max_dbm=drive_max,
+        ))
+
+    def key(s): return (s.name, s.mode, s.divider, round(s.f_out_hz, 0))
+    dedup = {key(s): s for s in sols}
+    out = list(dedup.values())
+
+    def dist(s): return min(abs(s.f_out_hz - ft) for ft in f_targets)
+    out.sort(key=dist)
+
+    if cap is not None and len(out) > cap:
+        out = out[:cap]
+    return out
+
+
+# --- IF2 refinement (deterministic coordinate descent + memo) ------------------------
 
 def _coordinate_descent_if2(
     if2_const: dict,
@@ -150,6 +352,7 @@ def _coordinate_descent_if2(
     """
     Internal helper that actually runs the loop. if2_const has keys:
       passband_il_db, stop_floor_db, rolloff_db_per_dec
+    Enhanced with memoization and an early-stop after two consecutive no-improve rounds.
     """
     c = float(seed_center_hz)
     b = float(seed_bw_hz)
@@ -160,21 +363,28 @@ def _coordinate_descent_if2(
         rolloff_db_per_dec=if2_const["rolloff_db_per_dec"],
     )
 
-    # Evaluate objective
+    memo: dict[tuple[float, float], float] = {}
+
     def score(win: IF2Parametric) -> float:
+        key = (round(win.center_hz, 1), round(win.bw_hz, 1))
+        if key in memo:
+            return memo[key]
         if2_des_center = abs(inj1 * lo1.f_out_hz - tile_if1.center_hz)
         if not win.contains_desired(center=if2_des_center, bw=tile_if1.bw_hz):
-            return -1e9
+            memo[key] = -1e9
+            return memo[key]
         summ = enumerate_spurs(
             tile_if1, lo1, lo2, win, rf_filter, mixer1, mixer2, cfg,
             inj1_sign=inj1, s2_sign=s2, carriers_lo1=carriers_lo1, carriers_lo2=carriers_lo2
         )
-        return float(summ.worst_margin_db)
+        memo[key] = float(summ.worst_margin_db)
+        return memo[key]
 
     best = score(best_win)
     dc = max(1.0, step_frac_center) * (tile_if1.bw_hz * 0.5)  # start with half-BW scaled step
     db = max(1.0, step_frac_bw) * (tile_if1.bw_hz * 0.3)
 
+    no_improve = 0
     for _ in range(max_iters):
         improved = False
         # Try center +/- dc
@@ -193,6 +403,13 @@ def _coordinate_descent_if2(
             if s > best + 1e-6:
                 best, b, best_win = s, b_try, win
                 improved = True
+
+        if improved:
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= 2:
+                break
 
         # Shrink steps
         dc *= 0.5
@@ -228,6 +445,11 @@ def _robustness_score(
     # IF1 ± half step (true recomputation, because IF2 desired depends on IF1)
     for sign in (+1, -1):
         if1_pert = Band(tile_if1.center_hz + sign * 0.5 * if1_step, tile_if1.bw_hz)
+        # Robustness guard: if desired IF2 drifts outside the IF2 passband, treat as hard fail
+        if2_des_center = abs(inj1 * lo1.f_out_hz - if1_pert.center_hz)
+        if not if2_use.contains_desired(center=if2_des_center, bw=if1_pert.bw_hz):
+            margins.append(-1e9)
+            continue
         summ = enumerate_spurs(
             if1_pert, lo1, lo2, if2_use, rf_filter, mixer1, mixer2, cfg,
             inj1_sign=inj1, s2_sign=s2, carriers_lo1=carriers_lo1, carriers_lo2=carriers_lo2
@@ -258,22 +480,37 @@ def _eval_tile(task_args) -> tuple[PlanRow | None, list[dict], dict] | None:
     Returns (best_row, alternatives_list, ledger_for_best) or None if no candidate.
     """
     t, cfg_dict, models_dir = task_args
-    cfg = Config(**cfg_dict)
 
-    # Load models (ALL candidates)
-    mixer1_mdls = [Mixer(MixerModel(**_load_yaml(models_dir, p))) for p in cfg.search.mixer1_candidates]
-    mixer2_mdls = [Mixer(MixerModel(**_load_yaml(models_dir, p))) for p in cfg.search.mixer2_candidates]
-    lo1_synths = [Synth(LOMdl(**_load_yaml(models_dir, p))) for p in cfg.search.lo1_candidates]
-    lo2_synths = [Synth(LOMdl(**_load_yaml(models_dir, p))) for p in cfg.search.lo2_candidates]
+    # Use process-global cache (initializer populates this)
+    global _MODELS
+    if _MODELS is None:
+        _init_models_once(models_dir, cfg_dict)
+    cache = _MODELS
 
-    # RF BPF set (decision variable)
-    rf_paths = cfg.search.rf_bpf_choices
-    rf_filters = []
-    for rp in rf_paths:
-        path = rp if os.path.isabs(rp) else os.path.join(models_dir, rp)
-        rf_filters.append(RFBPF.from_csv(path))
+    cfg = Config(**cache["cfg_dict"])
 
-    if2_yaml = _load_yaml(models_dir, cfg.search.if2_filter_model)
+    # Load models from cache
+    mixer1_mdls: List[Mixer] = cache["mixer1"]
+    mixer2_mdls: List[Mixer] = cache["mixer2"]
+    lo1_synths: List[Synth] = cache["lo1s"]
+    lo2_synths: List[Synth] = cache["lo2s"]
+    rf_filters: List[RFBPF] = cache["rfs"]
+    if2_yaml = cache["if2yaml"]
+
+    # ---- Optional: "search-order thinning" (keep parity via re-score later) ----
+    orig_cfg = Config(**cfg_dict)  # exact original for parity/scoring
+    used_thin_orders = False
+    search_mn = getattr(cfg.search, "search_orders_mn_abs", None)
+    search_sum = getattr(cfg.search, "search_cross_sum_max", None)
+    if (search_mn is not None) or (search_sum is not None):
+        cfg = cfg.model_copy()
+        if search_mn is not None:
+            cfg.orders.m1n1_max_abs = int(search_mn)
+            cfg.orders.m2n2_max_abs = int(search_mn)
+            used_thin_orders = True
+        if search_sum is not None:
+            cfg.orders.cross_stage_sum_max = int(search_sum)
+            used_thin_orders = True
 
     def _f(x, default=None):
         if x is None:
@@ -293,7 +530,8 @@ def _eval_tile(task_args) -> tuple[PlanRow | None, list[dict], dict] | None:
 
     # Search parameters (if present)
     search_cfg = (if2_yaml.get("search") or {})
-    seeds_per_tile = int(search_cfg.get("seeds_per_tile", 8) or 8)  # reserved, currently not used
+    # seeds_per_tile controls center/BW seed densities deterministically
+    seeds_per_tile = int(search_cfg.get("seeds_per_tile", 8) or 8)
     refine_kind = str(search_cfg.get("local_refinement", "coordinate_descent"))
     max_refine_iters = int(search_cfg.get("max_refine_iters", 12) or 12)
 
@@ -304,17 +542,41 @@ def _eval_tile(task_args) -> tuple[PlanRow | None, list[dict], dict] | None:
     alternatives: list[dict] = []
     best_ledger: dict = {}
 
-    # --- Derive IF2 seeds around IF1 center (targeted search) ---
-    seed_center_muls = (0.7, 0.85, 1.0, 1.15, 1.3)
-    if2_center_seeds = [float(np.clip(m * t.if1_center_hz, if2_center_range[0], if2_center_range[1])) for m in seed_center_muls]
-    if2_center_seeds = sorted(set(if2_center_seeds))  # determinism
+    # --- Derive IF2 seeds: local neighborhood + global anchors ---
+    num_c = max(3, int(seeds_per_tile))
+    center_lo_mul, center_hi_mul = 0.7, 1.3
+    local_center_seeds = [float(np.clip(m * t.if1_center_hz, if2_center_range[0], if2_center_range[1]))
+                          for m in np.linspace(center_lo_mul, center_hi_mul, num_c)]
+    # A few coarse global anchors spanning the allowed IF2 center range
+    global_anchors = list(np.linspace(if2_center_range[0], if2_center_range[1], 4))
+    if2_center_seeds = sorted(set(map(float, [*local_center_seeds, *global_anchors])))
 
     # IF2 BW seeds around required BW
-    bw_seed_list = (1.05, 1.2, 1.5)
+    base_bw_low, base_bw_high = 1.05, 1.5
+    n_bw = int(max(2, min(5, math.ceil(seeds_per_tile / 3))))
+    if n_bw == 2:
+        bw_seed_muls = (base_bw_low, base_bw_high)
+    else:
+        bw_seed_muls = tuple(np.linspace(base_bw_low, base_bw_high, n_bw))
+    bw_seed_list = bw_seed_muls
+
+    # Fast/legacy toggle
+    use_fast = bool(getattr(cfg.search, "enable_snapped_lo_search", True))
+    base_N = int(getattr(cfg.search, "lo_snap_window_steps", 2))
+    expand_sched = list(getattr(cfg.search, "lo_snap_expand_schedule", [2, 4, 8]))
+    hard_max = int(getattr(cfg.search, "lo_snap_max_window_steps", 8))
+    cap_per_lo = getattr(cfg.search, "per_lo_candidate_cap", None)
+    include_lo2_alt = bool(getattr(cfg.search, "include_lo2_alt_form", False))
+
+    # respect optional desired sign locks (±1) for desired path
+    desired_s1 = getattr(cfg.constraints, "desired_stage1_sign", None)
+    desired_s2 = getattr(cfg.constraints, "desired_stage2_sign", None)
+    inj1_opts = ([int(desired_s1)] if desired_s1 in (-1, 1) else (+1, -1))
+    s2_opts = ([int(desired_s2)] if desired_s2 in (-1, 1) else (+1, -1))
 
     for mixer1 in mixer1_mdls:
         for mixer2 in mixer2_mdls:
-            for inj1 in (+1, -1):
+            for inj1 in inj1_opts:
                 for if2c_seed in if2_center_seeds:
                     for bw_mul in bw_seed_list:
                         if2_bw_seed = float(np.clip(bw_mul * t.bw_hz, if2_min_bw, if2_max_bw))
@@ -326,192 +588,286 @@ def _eval_tile(task_args) -> tuple[PlanRow | None, list[dict], dict] | None:
                         if alt_t > 0:
                             lo1_targets.append(alt_t)
 
-                        # Enumerate LO1 and LO2 legal settings in a widened window (P2)
+                        # Enumerate LO1 candidates via snapped neighborhoods (or legacy)
+                        lo1_settings = []
                         for lo1_synth in lo1_synths:
-                            fmin1 = max(1.0, min(lo1_targets) - 3 * t.bw_hz)
-                            fmax1 = max(lo1_targets) + 3 * t.bw_hz
-                            lo1_settings = lo1_synth.legal_settings(
-                                name_filter=None,
-                                f_min=fmin1,
-                                f_max=fmax1,
-                                path="lo1",
-                                drive_min_dbm=mixer1.mdl.required_lo_drive_dbm["min"],
-                                drive_max_dbm=mixer1.mdl.required_lo_drive_dbm["max"],
-                            )
-                            if not lo1_settings:
+                            if use_fast:
+                                lo1_settings.extend(_neighborhood_solutions(
+                                    synth=lo1_synth,
+                                    f_targets=lo1_targets,
+                                    path="lo1",
+                                    drive_min=mixer1.mdl.required_lo_drive_dbm["min"],
+                                    drive_max=mixer1.mdl.required_lo_drive_dbm["max"],
+                                    base_N=base_N,
+                                    expand_sched=expand_sched,
+                                    hard_max=hard_max,
+                                    cap=cap_per_lo,
+                                    bw_hz_for_fallback=t.bw_hz,
+                                ))
+                            else:
+                                fmin1 = max(1.0, min(lo1_targets) - 3 * t.bw_hz)
+                                fmax1 = max(lo1_targets) + 3 * t.bw_hz
+                                lo1_settings.extend(lo1_synth.legal_settings(
+                                    name_filter=None,
+                                    f_min=fmin1,
+                                    f_max=fmax1,
+                                    path="lo1",
+                                    drive_min_dbm=mixer1.mdl.required_lo_drive_dbm["min"],
+                                    drive_max_dbm=mixer1.mdl.required_lo_drive_dbm["max"],
+                                ))
+                        if not lo1_settings:
+                            continue
+
+                        for lo1 in lo1_settings:
+                            # Require desired IF2 band to be inside the IF2 passband
+                            if2_des_center = abs(inj1 * lo1.f_out_hz - t.if1_center_hz)
+                            if not if2_template.contains_desired(if2_des_center, t.bw_hz):
                                 continue
 
-                            for lo1 in lo1_settings:
-                                # NOW we know the desired IF2 center; require the desired band inside IF2 passband
-                                if2_des_center = abs(inj1 * lo1.f_out_hz - t.if1_center_hz)
-                                if not if2_template.contains_desired(if2_des_center, t.bw_hz):
-                                    continue
+                            for s2 in s2_opts:
+                                # Stage-2 targets
+                                cand2 = [s2 * (t.rf_center_hz - if2c_seed)]
+                                if include_lo2_alt:
+                                    cand2.append(s2 * (-t.rf_center_hz - if2c_seed))
 
-                                for s2 in (+1, -1):
-                                    # Stage-2 targets based on desired RF = | s2*LO2 + IF2 | = t.rf_center_hz
-                                    candidates = [s2 * (t.rf_center_hz - if2c_seed), s2 * (-t.rf_center_hz - if2c_seed)]
-                                    for lo2_synth in lo2_synths:
-                                        fmin2 = min(candidates) - 3 * t.bw_hz
-                                        fmax2 = max(candidates) + 3 * t.bw_hz
-                                        lo2_settings = lo2_synth.legal_settings(
+                                lo2_settings = []
+                                for lo2_synth in lo2_synths:
+                                    if use_fast:
+                                        lo2_settings.extend(_neighborhood_solutions(
+                                            synth=lo2_synth,
+                                            f_targets=cand2,
+                                            path="lo2",
+                                            drive_min=mixer2.mdl.required_lo_drive_dbm["min"],
+                                            drive_max=mixer2.mdl.required_lo_drive_dbm["max"],
+                                            base_N=base_N,
+                                            expand_sched=expand_sched,
+                                            hard_max=hard_max,
+                                            cap=cap_per_lo,
+                                            bw_hz_for_fallback=t.bw_hz,
+                                        ))
+                                    else:
+                                        fmin2 = min(cand2) - 3 * t.bw_hz
+                                        fmax2 = max(cand2) + 3 * t.bw_hz
+                                        lo2_settings.extend(lo2_synth.legal_settings(
                                             name_filter=None,
                                             f_min=max(1.0, fmin2),
                                             f_max=fmax2,
                                             path="lo2",
                                             drive_min_dbm=mixer2.mdl.required_lo_drive_dbm["min"],
                                             drive_max_dbm=mixer2.mdl.required_lo_drive_dbm["max"],
-                                        )
-                                        if not lo2_settings:
+                                        ))
+                                if not lo2_settings:
+                                    continue
+
+                                for lo2 in lo2_settings:
+                                    # Verify desired RF placement under these LOs
+                                    _, rf_des_chk = desired_paths(tile_if1, lo1.f_out_hz, lo2.f_out_hz, inj1, s2)
+                                    if abs(rf_des_chk.center_hz - t.rf_center_hz) > (cfg.grids.rf_center_step_hz * 0.5 + 1e3):
+                                        continue
+
+                                    # Build equivalent carriers (with divider-spectrum behavior) using chosen PFD
+                                    mode1 = next((m for m in lo1_synths[0].mdl.modes if m.name == lo1.mode), None)
+                                    if mode1 is None:
+                                        # fetch from the specific synth used to create lo1
+                                        for s in lo1_synths:
+                                            if s.mdl.name == lo1.name:
+                                                mode1 = next((m for m in s.mdl.modes if m.name == lo1.mode), s.mdl.modes[0])
+                                                break
+                                    mode2 = next((m for m in lo2_synths[0].mdl.modes if m.name == lo2.mode), None)
+                                    if mode2 is None:
+                                        for s in lo2_synths:
+                                            if s.mdl.name == lo2.name:
+                                                mode2 = next((m for m in s.mdl.modes if m.name == lo2.mode), s.mdl.modes[0])
+                                                break
+                                    # use the synth that matches the LO name for carriers
+                                    s1_for_car = next((s for s in lo1_synths if s.mdl.name == lo1.name), lo1_synths[0])
+                                    s2_for_car = next((s for s in lo2_synths if s.mdl.name == lo2.name), lo2_synths[0])
+                                    C1 = s1_for_car.equivalent_carriers(lo1.f_out_hz, mode1, lo1.divider, pfd_hz=lo1.pfd_hz)
+                                    C2 = s2_for_car.equivalent_carriers(lo2.f_out_hz, mode2, lo2.divider, pfd_hz=lo2.pfd_hz)
+
+                                    # Desired RF band must be inside RF BPF passband
+                                    for rf_filter in rf_filters:
+                                        if not _rf_band_ok(rf_filter, rf_des_chk.center_hz, t.bw_hz, max_il_db=3.0):
                                             continue
 
-                                        for lo2 in lo2_settings:
-                                            # Verify desired RF placement under these LOs
-                                            _, rf_des_chk = desired_paths(tile_if1, lo1.f_out_hz, lo2.f_out_hz, inj1, s2)
-                                            if abs(rf_des_chk.center_hz - t.rf_center_hz) > (cfg.grids.rf_center_step_hz * 0.5 + 1e3):
-                                                continue
+                                        # Early reject gates
+                                        if _early_reject_gate(tile_if1, lo1.f_out_hz, lo2.f_out_hz, inj1, s2, if2_template, rf_filter, cfg):
+                                            continue
 
-                                            # Build equivalent carriers (with divider-spectrum behavior) using chosen PFD
-                                            mode1 = next((m for m in lo1_synth.mdl.modes if m.name == lo1.mode), lo1_synth.mdl.modes[0])
-                                            mode2 = next((m for m in lo2_synth.mdl.modes if m.name == lo2.mode), lo2_synth.mdl.modes[0])
-                                            C1 = lo1_synth.equivalent_carriers(lo1.f_out_hz, mode1, lo1.divider, pfd_hz=lo1.pfd_hz)
-                                            C2 = lo2_synth.equivalent_carriers(lo2.f_out_hz, mode2, lo2.divider, pfd_hz=lo2.pfd_hz)
+                                        # --- IF2 refinement (coordinate descent + memo) ---
+                                        if refine_kind == "coordinate_descent" and max_refine_iters > 0:
+                                            if2_const = {
+                                                "passband_il_db": if2_pass_il,
+                                                "stop_floor_db": if2_floor,
+                                                "rolloff_db_per_dec": if2_roll,
+                                            }
+                                            if2_use = _coordinate_descent_if2(
+                                                if2_const=if2_const,
+                                                seed_center_hz=if2c_seed,
+                                                seed_bw_hz=if2_bw_seed,
+                                                tile_if1=tile_if1,
+                                                lo1=lo1,
+                                                lo2=lo2,
+                                                rf_filter=rf_filter,
+                                                mixer1=mixer1,
+                                                mixer2=mixer2,
+                                                cfg=cfg,
+                                                inj1=inj1,
+                                                s2=s2,
+                                                carriers_lo1=C1,
+                                                carriers_lo2=C2,
+                                                max_iters=max_refine_iters,
+                                                step_frac_center=0.1,
+                                                step_frac_bw=0.15,
+                                                bw_limits=(if2_min_bw, if2_max_bw),
+                                                center_limits=if2_center_range,
+                                            )
+                                        else:
+                                            if2_use = if2_template
 
-                                            # Desired RF band must be inside RF BPF passband (edges too)
-                                            for rf_filter in rf_filters:
-                                                if not _rf_band_ok(rf_filter, rf_des_chk.center_hz, t.bw_hz, max_il_db=3.0):
-                                                    continue
+                                        # Base evaluation (possibly under thinned orders)
+                                        summ = enumerate_spurs(
+                                            tile_if1,
+                                            lo1,
+                                            lo2,
+                                            if2_use,
+                                            rf_filter,
+                                            mixer1,
+                                            mixer2,
+                                            cfg,
+                                            inj1_sign=inj1,
+                                            s2_sign=s2,
+                                            carriers_lo1=C1,
+                                            carriers_lo2=C2,
+                                        )
 
-                                                # Early reject gates (includes desired-equivalence checks)
-                                                if _early_reject_gate(tile_if1, lo1.f_out_hz, lo2.f_out_hz, inj1, s2, if2_template, rf_filter, cfg):
-                                                    continue
+                                        # Robustness evaluation (± half-steps) with IF2 containment guard
+                                        robust_margin, brittleness = _robustness_score(
+                                            base_summary=summ,
+                                            tile_if1=tile_if1,
+                                            lo1=lo1,
+                                            lo2=lo2,
+                                            if2_use=if2_use,
+                                            rf_filter=rf_filter,
+                                            mixer1=mixer1,
+                                            mixer2=mixer2,
+                                            cfg=cfg,
+                                            inj1=inj1,
+                                            s2=s2,
+                                            carriers_lo1=C1,
+                                            carriers_lo2=C2,
+                                            rf_center_nominal=t.rf_center_hz,
+                                            if1_step=cfg.grids.if1_center_step_hz,
+                                            rf_step=cfg.grids.rf_center_step_hz,
+                                        )
 
-                                                # --- IF2 refinement (coordinate descent) ---
-                                                if refine_kind == "coordinate_descent" and max_refine_iters > 0:
-                                                    if2_const = {
-                                                        "passband_il_db": if2_pass_il,
-                                                        "stop_floor_db": if2_floor,
-                                                        "rolloff_db_per_dec": if2_roll,
+                                        score = robust_margin
+
+                                        # Construct row for this candidate
+                                        row = PlanRow(
+                                            tile_id=t.id,
+                                            if1_center_hz=t.if1_center_hz,
+                                            bw_hz=t.bw_hz,
+                                            rf_center_hz=t.rf_center_hz,
+                                            lo1_name=lo1.name,
+                                            lo1_hz=lo1.f_out_hz,
+                                            lo1_mode=lo1.mode,
+                                            lo1_divider=lo1.divider,
+                                            lo1_pad_db=lo1.pad_db,
+                                            lo1_lock_ms=lo1.lock_time_ms,
+                                            lo2_name=lo2.name,
+                                            lo2_hz=lo2.f_out_hz,
+                                            lo2_mode=lo2.mode,
+                                            lo2_divider=lo2.divider,
+                                            lo2_pad_db=lo2.pad_db,
+                                            lo2_lock_ms=lo2.lock_time_ms,
+                                            if2_center_hz=if2_use.center_hz,
+                                            if2_bw_hz=if2_use.bw_hz,
+                                            rf_bpf_id=rf_filter.id,
+                                            spur_margin_db=score,
+                                            brittleness_db_per_step=brittleness,
+                                            desired_stage1_sign=inj1,
+                                            desired_stage2_sign=s2,
+                                        )
+
+                                        if (best_row is None) or (score > best_score + 1e-9):
+                                            # New best: reset alternatives
+                                            best_row = row
+                                            best_summary = summ
+                                            best_score = score
+                                            alternatives = []
+                                            # capture ledger (bins) for the current best
+                                            best_ledger = {
+                                                "rf_center_hz": float(summ.desired_rf_band.center_hz),
+                                                "rf_bw_hz": float(summ.desired_rf_band.bw_hz),
+                                                "bins": [
+                                                    {
+                                                        "f_rf_hz": b.f_rf_hz,
+                                                        "combined_level_dbc": b.level_dbc,
+                                                        "inband": b.inband,
+                                                        "limit_dbc": b.info.get("limit_dbc"),
+                                                        "margin_db": b.info.get("margin_db"),
                                                     }
-                                                    if2_use = _coordinate_descent_if2(
-                                                        if2_const=if2_const,
-                                                        seed_center_hz=if2c_seed,
-                                                        seed_bw_hz=if2_bw_seed,
-                                                        tile_if1=tile_if1,
-                                                        lo1=lo1,
-                                                        lo2=lo2,
-                                                        rf_filter=rf_filter,
-                                                        mixer1=mixer1,
-                                                        mixer2=mixer2,
-                                                        cfg=cfg,
-                                                        inj1=inj1,
-                                                        s2=s2,
-                                                        carriers_lo1=C1,
-                                                        carriers_lo2=C2,
-                                                        max_iters=max_refine_iters,
-                                                        step_frac_center=0.1,
-                                                        step_frac_bw=0.15,
-                                                        bw_limits=(if2_min_bw, if2_max_bw),
-                                                        center_limits=if2_center_range,
-                                                    )
-                                                else:
-                                                    if2_use = if2_template
-
-                                                # Base evaluation
-                                                summ = enumerate_spurs(
-                                                    tile_if1,
-                                                    lo1,
-                                                    lo2,
-                                                    if2_use,
-                                                    rf_filter,
-                                                    mixer1,
-                                                    mixer2,
-                                                    cfg,
-                                                    inj1_sign=inj1,
-                                                    s2_sign=s2,
-                                                    carriers_lo1=C1,
-                                                    carriers_lo2=C2,
-                                                )
-
-                                                # Robustness evaluation (± half-steps)
-                                                robust_margin, brittleness = _robustness_score(
-                                                    base_summary=summ,
-                                                    tile_if1=tile_if1,
-                                                    lo1=lo1,
-                                                    lo2=lo2,
-                                                    if2_use=if2_use,
-                                                    rf_filter=rf_filter,
-                                                    mixer1=mixer1,
-                                                    mixer2=mixer2,
-                                                    cfg=cfg,
-                                                    inj1=inj1,
-                                                    s2=s2,
-                                                    carriers_lo1=C1,
-                                                    carriers_lo2=C2,
-                                                    rf_center_nominal=t.rf_center_hz,
-                                                    if1_step=cfg.grids.if1_center_step_hz,
-                                                    rf_step=cfg.grids.rf_center_step_hz,
-                                                )
-
-                                                score = robust_margin
-
-                                                # Construct row for this candidate
-                                                row = PlanRow(
-                                                    tile_id=t.id,
-                                                    if1_center_hz=t.if1_center_hz,
-                                                    bw_hz=t.bw_hz,
-                                                    rf_center_hz=t.rf_center_hz,
-                                                    lo1_name=lo1.name,
-                                                    lo1_hz=lo1.f_out_hz,
-                                                    lo1_mode=lo1.mode,
-                                                    lo1_divider=lo1.divider,
-                                                    lo1_pad_db=lo1.pad_db,
-                                                    lo1_lock_ms=lo1.lock_time_ms,
-                                                    lo2_name=lo2.name,
-                                                    lo2_hz=lo2.f_out_hz,
-                                                    lo2_mode=lo2.mode,
-                                                    lo2_divider=lo2.divider,
-                                                    lo2_pad_db=lo2.pad_db,
-                                                    lo2_lock_ms=lo2.lock_time_ms,
-                                                    if2_center_hz=if2_use.center_hz,
-                                                    if2_bw_hz=if2_use.bw_hz,
-                                                    rf_bpf_id=rf_filter.id,
-                                                    spur_margin_db=score,
-                                                    brittleness_db_per_step=brittleness,
-                                                    desired_stage1_sign=inj1,
-                                                    desired_stage2_sign=s2,
-                                                )
-
-                                                if (best_row is None) or (score > best_score + 1e-9):
-                                                    # New best: reset alternatives
-                                                    best_row = row
-                                                    best_summary = summ
-                                                    best_score = score
-                                                    alternatives = []
-                                                    # capture ledger (bins) for the current best
-                                                    best_ledger = {
-                                                        "rf_center_hz": float(summ.desired_rf_band.center_hz),
-                                                        "rf_bw_hz": float(summ.desired_rf_band.bw_hz),
-                                                        "bins": [
-                                                            {
-                                                                "f_rf_hz": b.f_rf_hz,
-                                                                "combined_level_dbc": b.level_dbc,
-                                                                "inband": b.inband,
-                                                                "limit_dbc": b.info.get("limit_dbc"),
-                                                                "margin_db": b.info.get("margin_db"),
-                                                            }
-                                                            for b in summ.bins
-                                                        ],
-                                                    }
-                                                else:
-                                                    # Track alternatives within Δ dB of best
-                                                    if best_row is not None and (best_score - score) <= float(cfg.targets.alt_within_db + 1e-9):
-                                                        alternatives.append({
-                                                            "delta_margin_db": float(best_score - score),
-                                                            "row": asdict(row),
-                                                        })
+                                                    for b in summ.bins
+                                                ],
+                                            }
+                                        else:
+                                            # Track alternatives within Δ dB of best
+                                            if best_row is not None and (best_score - score) <= float(cfg.targets.alt_within_db + 1e-9):
+                                                alternatives.append({
+                                                    "delta_margin_db": float(best_score - score),
+                                                    "row": asdict(row),
+                                                })
 
     if best_row is None:
         return None
+
+    # If we used thinned orders for speed, re-score the selected BEST at full/original orders for parity.
+    if used_thin_orders and best_summary is not None:
+        full_cfg = orig_cfg
+        # Recompute carriers (same synths) for the chosen LOs
+        lo1_synth = next((s for s in lo1_synths if s.mdl.name == best_row.lo1_name), lo1_synths[0])
+        lo2_synth = next((s for s in lo2_synths if s.mdl.name == best_row.lo2_name), lo2_synths[0])
+        mode1 = next((m for m in lo1_synth.mdl.modes if m.name == best_row.lo1_mode), lo1_synth.mdl.modes[0])
+        mode2 = next((m for m in lo2_synth.mdl.modes if m.name == best_row.lo2_mode), lo2_synth.mdl.modes[0])
+        # Minimal LOSolution-like shims using best_row fields
+        class _Shim:
+            def __init__(self, name, mode, f_out_hz, divider, delivered_dbm, lock_time_ms, pad_db, pfd_hz):
+                self.name=name; self.mode=mode; self.f_out_hz=f_out_hz; self.divider=divider
+                self.delivered_dbm=delivered_dbm; self.lock_time_ms=lock_time_ms; self.pad_db=pad_db; self.pfd_hz=pfd_hz
+        lo1 = _Shim(best_row.lo1_name, best_row.lo1_mode, best_row.lo1_hz, best_row.lo1_divider, 0.0, best_row.lo1_lock_ms, best_row.lo1_pad_db, 10e6)
+        lo2 = _Shim(best_row.lo2_name, best_row.lo2_mode, best_row.lo2_hz, best_row.lo2_divider, 0.0, best_row.lo2_lock_ms, best_row.lo2_pad_db, 10e6)
+        C1 = lo1_synth.equivalent_carriers(lo1.f_out_hz, mode1, lo1.divider, pfd_hz=lo1.pfd_hz)
+        C2 = lo2_synth.equivalent_carriers(lo2.f_out_hz, mode2, lo2.divider, pfd_hz=lo2.pfd_hz)
+        rf_filter = next((rf for rf in rf_filters if rf.id == best_row.rf_bpf_id), rf_filters[0])
+        if2_use = IF2Parametric(best_row.if2_center_hz, best_row.if2_bw_hz,
+                                if2_pass_il, if2_floor, if2_roll)
+        mixer1 = mixer1_mdls[0] if mixer1_mdls else None
+        mixer2 = mixer2_mdls[0] if mixer2_mdls else None
+        if mixer1 and mixer2:
+            summ_full = enumerate_spurs(
+                Band(best_row.if1_center_hz, best_row.bw_hz),
+                lo1, lo2, if2_use, rf_filter, mixer1, mixer2, full_cfg,
+                inj1_sign=best_row.desired_stage1_sign,
+                s2_sign=best_row.desired_stage2_sign,
+                carriers_lo1=C1, carriers_lo2=C2
+            )
+            # overwrite margin (and ledger) with full-order result
+            best_row.spur_margin_db = float(summ_full.worst_margin_db)
+            best_ledger = {
+                "rf_center_hz": float(summ_full.desired_rf_band.center_hz),
+                "rf_bw_hz": float(summ_full.desired_rf_band.bw_hz),
+                "bins": [
+                    {
+                        "f_rf_hz": b.f_rf_hz,
+                        "combined_level_dbc": b.level_dbc,
+                        "inband": b.inband,
+                        "limit_dbc": b.info.get("limit_dbc"),
+                        "margin_db": b.info.get("margin_db"),
+                    }
+                    for b in summ_full.bins
+                ],
+            }
 
     # Rank alternatives (smallest delta first)
     alternatives.sort(key=lambda d: d.get("delta_margin_db", 999.0))
@@ -685,7 +1041,7 @@ def optimize(cfg: Config, models_dir: str, input_files: list[str] | None = None,
     RF passband edge checks, retune accounting with Δf and penalties.
     Export spur ledgers for best per-tile and coverage gaps; broaden LO search windows (P2);
     generate RF spans per IF1/BW (P2); include file hashes and package versions (P1).
-    **NEW**: policy-level second-pass selection using retune/lock-time as a tie-breaker among per-tile alternatives.
+    **NEW**: process-global model cache; IF2 refinement memoization; wider LO2 harmonic quick-screen.
     """
     # Deterministic tiles
     tiles = make_tiles(
@@ -705,25 +1061,30 @@ def optimize(cfg: Config, models_dir: str, input_files: list[str] | None = None,
     ledgers_by_tile: dict[int, dict] = {}
     gaps: list[dict] = []
 
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as ex:
-        futs = [ex.submit(_eval_tile, args) for args in tasks]
-        for f in as_completed(futs):
-            try:
-                res = f.result()
-                if res is not None:
-                    best_row, alts, ledger = res
-                    rows.append(best_row)
-                    if alts:
-                        alts_by_tile[best_row.tile_id] = alts
-                    if ledger:
-                        ledgers_by_tile[best_row.tile_id] = ledger
-                else:
-                    # No legal candidate for this tile
-                    pass
-            finally:
-                if progress_cb is not None:
+    # Wrap executor loop with an auto progress context when no callback was given
+    with _progress_ctx(total=len(tasks), desc="Tiles", provided_cb=progress_cb) as _update:
+        with ProcessPoolExecutor(
+            max_workers=os.cpu_count(),
+            initializer=_init_models_once,
+            initargs=(models_dir, cfg.model_dump()),
+        ) as ex:
+            futs = [ex.submit(_eval_tile, args) for args in tasks]
+            for f in as_completed(futs):
+                try:
+                    res = f.result()
+                    if res is not None:
+                        best_row, alts, ledger = res
+                        rows.append(best_row)
+                        if alts:
+                            alts_by_tile[best_row.tile_id] = alts
+                        if ledger:
+                            ledgers_by_tile[best_row.tile_id] = ledger
+                    else:
+                        # No legal candidate for this tile
+                        pass
+                finally:
                     try:
-                        progress_cb(1)
+                        _update(1)
                     except Exception:
                         pass
 
@@ -756,7 +1117,7 @@ def optimize(cfg: Config, models_dir: str, input_files: list[str] | None = None,
                 "target_db": float(cfg.targets.min_margin_db)
             })
 
-    # ---- NEW: second-pass policy-level selection (tie-break by retune/lock) ----
+    # ---- second-pass policy-level selection (tie-break by retune/lock and brittleness) ----
     # Build LO model lookup by name for hop computations (also used later for accounting)
     lo_models_by_name: Dict[str, LOMdl] = {}
     for path in (cfg.search.lo1_candidates + cfg.search.lo2_candidates):
@@ -784,8 +1145,9 @@ def optimize(cfg: Config, models_dir: str, input_files: list[str] | None = None,
     prev: PlanRow | None = None
     for t in sorted(candidates_by_tile.keys()):
         candset = candidates_by_tile[t]
-        # Stable order: highest margin first as tiebreaker base
-        candset.sort(key=lambda c: (-float(c.spur_margin_db), c.lo1_name, c.lo2_name, c.if2_center_hz, c.if2_bw_hz))
+        # Stable order: highest margin first; on near ties prefer lower brittleness
+        candset.sort(key=lambda c: (-float(c.spur_margin_db), float(c.brittleness_db_per_step),
+                                    c.lo1_name, c.lo2_name, c.if2_center_hz, c.if2_bw_hz))
         best_c = None
         best_score = -1e18
         for c in candset:
@@ -802,7 +1164,9 @@ def optimize(cfg: Config, models_dir: str, input_files: list[str] | None = None,
                     hop_ms += _lock_time_for_hop(prev.lo2_hz, prev.lo2_mode, prev.lo2_divider,
                                                  c.lo2_hz, c.lo2_mode, c.lo2_divider, mdl2)
             score = float(c.spur_margin_db) - lam_scale * lam * hop_ms
-            if score > best_score + 1e-12:
+            # Soft preference for lower brittleness when score is effectively equal
+            if (score > best_score + 1e-12) or (abs(score - best_score) <= 1e-12 and best_c and
+                                                c.brittleness_db_per_step < best_c.brittleness_db_per_step):
                 best_score = score
                 best_c = c
         if best_c is None:
@@ -835,6 +1199,28 @@ def optimize(cfg: Config, models_dir: str, input_files: list[str] | None = None,
         except Exception:
             versions[pkg] = "n/a"
 
+    # ---- IF2 window export (unique windows used in the chosen policy) ----
+    # We reload IF2 YAML to get constants; windows differ by center/BW here.
+    if2_yaml = _load_yaml(models_dir, cfg.search.if2_filter_model)
+    pass_il = float(if2_yaml.get("passband_il_db", 1.0))
+    floor_db = float(if2_yaml.get("stop_floor_db", -80.0))
+    roll_db_dec = float(if2_yaml.get("rolloff_db_per_dec", 40.0))
+
+    from collections import Counter
+    # Round to 1 kHz for uniqueness (consistent with earlier eps used)
+    def q1k(x: float) -> float:
+        return round(float(x) / 1e3) * 1e3
+
+    counts = Counter((q1k(r.if2_center_hz), q1k(r.if2_bw_hz)) for r in rows)
+    if2_windows = [{
+        "center_hz": float(k[0]),
+        "bw_hz": float(k[1]),
+        "passband_il_db": pass_il,
+        "stop_floor_db": floor_db,
+        "rolloff_db_per_dec": roll_db_dec,
+        "use_count": int(v),
+    } for k, v in sorted(counts.items(), key=lambda kv: (kv[0][0], kv[0][1]))]
+
     policy = {
         "project": cfg.project.model_dump(),
         "grids": cfg.grids.model_dump(),
@@ -845,6 +1231,7 @@ def optimize(cfg: Config, models_dir: str, input_files: list[str] | None = None,
         "ledgers": ledgers_by_tile,  # per-tile best spur bins
         "spans": spans,
         "coverage_gaps": gaps,
+        "if2_windows": if2_windows,
         "meta": {
             "deterministic_seed": cfg.project.seed,
             "retune_accounting": retune_meta,

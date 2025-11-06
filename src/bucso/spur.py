@@ -42,14 +42,10 @@ def desired_paths(tile_if1: Band, lo1: float, lo2: float, inj1: int, s2_sign: in
     return if2, rf
 
 
-def _in_if2_passband(f_hz: float, if2: IF2Parametric) -> bool:
-    return abs(f_hz - if2.center_hz) <= (if2.bw_hz / 2.0)
-
-
-def _interp_mask_flat_or_table(default_dbc: float, table, x: np.ndarray, *, is_oob_abs_freq: bool) -> np.ndarray:
+def _interp_mask_flat_or_table(default_dbc: float, table, x: np.ndarray) -> np.ndarray:
     """
     Returns a vector of limits starting from default_dbc, optionally overridden by a table.
-    For in-band: x is offset-from-edge (>=0). For OOB: x is absolute frequency.
+    x can be absolute frequency OR offset-from-edge depending on caller.
     IMPORTANT: np.interp left/right must be scalars, not arrays.
     """
     limits = np.full_like(x, float(default_dbc), dtype=float)
@@ -180,11 +176,12 @@ def enumerate_spurs(
                                         continue
 
                                     # *** Skip the exact desired mechanism counted as spur ***
+                                    # This covers all first-order products that land on the desired frequency.
                                     if (
-                                        (m1 == inj1_sign)
+                                        (abs(m1) == 1)
                                         and (n1 == 1)
                                         and (c1.tag == "main")
-                                        and (m2 == s2_sign)
+                                        and (abs(m2) == 1)
                                         and (n2 == 1)
                                         and (c2.tag == "main")
                                         and (abs(f_rf_c - rf_des_nom.center_hz) <= bin_w * 0.5)
@@ -241,29 +238,36 @@ def enumerate_spurs(
     # LO2 feedthroughs at RF: include main + harmonics (use isolation plus carrier rel_dBc)
     for c2 in carriers_lo2:
         f = c2.freq_hz
-        if (rf_lo - 2 * bin_w) <= f <= (rf_hi + 2 * bin_w):
-            L = mix2.mdl.isolation.lo_to_rf_db + c2.rel_dBc + (float(rf_attn(f)) - rf_attn_des)
-            freq_list.append(f)
-            level_list.append(L)
+        # FIX: The aggressive OOB filter is removed here to ensure critical LO feedthrough spurs are always evaluated.
+        # This has negligible performance impact as the loop is very small.
+        L = mix2.mdl.isolation.lo_to_rf_db + c2.rel_dBc + (float(rf_attn(f)) - rf_attn_des)
+        freq_list.append(f)
+        level_list.append(L)
 
-    # Coalesce by RBW window
+    # Coalesce by RBW fixed bins
     freqs = np.asarray(freq_list, dtype=float)
     levs = np.asarray(level_list, dtype=float)
     cf, cL = coalesce_bins(freqs, levs, bin_w)
 
-    # Margins vs masks (flat or offset-dependent)
+    # In-band classification & limits
     inband_mask = np.abs(cf - rf_des.center_hz) <= (rf_des.bw_hz / 2.0 + bin_w / 2.0)
 
-    # In-band limits: default or table vs offset-from-edge (>=0 inside band is 0)
+    # Edge-relative offsets (>=0 inside band is 0); outside is distance to nearest edge
     edge = rf_des.bw_hz / 2.0
-    offsets_edge = np.clip(np.abs(cf - rf_des.center_hz) - edge, 0.0, None)
+    dist_from_edge = np.clip(np.abs(cf - rf_des.center_hz) - edge, 0.0, None)
+
+    # In-band limits (flat or table vs offset-from-edge = 0 inside)
     lim_in = _interp_mask_flat_or_table(
-        cfg.masks.inband.default_dbc, cfg.masks.inband.table, offsets_edge, is_oob_abs_freq=False
+        cfg.masks.inband.default_dbc, cfg.masks.inband.table, dist_from_edge
     )
 
-    # Out-of-band limits: default or table vs absolute frequency
+    # Out-of-band limits: absolute or edge_relative, per config
+    if (getattr(cfg.masks.outofband, "mode", "absolute") == "edge_relative"):
+        oob_arg = dist_from_edge  # distance from band edge
+    else:
+        oob_arg = cf  # absolute frequency
     lim_oob = _interp_mask_flat_or_table(
-        cfg.masks.outofband.default_dbc, cfg.masks.outofband.table, cf, is_oob_abs_freq=True
+        cfg.masks.outofband.default_dbc, cfg.masks.outofband.table, oob_arg
     )
 
     limits = np.where(inband_mask, lim_in, lim_oob).astype(float)

@@ -1,8 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Iterable, Tuple, Optional
+from functools import lru_cache
 import numpy as np
-from .models import LOMdl, Mode
+from .models import LOMdl, Mode, PfdComponent
 
 
 @dataclass(frozen=True)
@@ -43,17 +44,30 @@ class Synth:
         loss = self.mdl.distribution.path_losses_db.get(path, 0.0)
         return p - loss - pad_db
 
-    def equivalent_carriers(
+    @staticmethod
+    def _apply_pfd_rolloff(comp: PfdComponent, k: int, f_pfd: float) -> float:
+        """
+        Roll-off model for PFD families:
+          rel_dBc = base_rel_dBc - rolloff_dB_per_dec * log10(max((k*f_pfd)/corner_hz, 1))
+        If corner_hz is not provided, roll off vs k: log10(max(k,1)).
+        """
+        if comp.rolloff_dB_per_dec is None or comp.rolloff_dB_per_dec <= 0:
+            return float(comp.base_rel_dBc)
+        if comp.corner_hz and comp.corner_hz > 0:
+            ratio = max((k * f_pfd) / float(comp.corner_hz), 1.0)
+        else:
+            ratio = max(float(k), 1.0)
+        return float(comp.base_rel_dBc) - float(comp.rolloff_dB_per_dec) * np.log10(ratio)
+
+    # --------- cached carrier builder ---------
+
+    def _equivalent_carriers_no_cache(
         self,
         f_out_hz: float,
         mode: Mode,
         divider: str,
         pfd_hz: float | None = None,
     ) -> List[LOCarrier]:
-        """
-        Build equivalent LO carriers at the *output* (post-divider) with relative levels.
-        Apply divider-spectrum harmonic deltas to harmonics.
-        """
         carriers: List[LOCarrier] = [LOCarrier(f_out_hz, 0.0, "main")]
 
         harm_delta = self.mdl.divider_spectrum.get(divider, None)
@@ -65,25 +79,57 @@ class Synth:
             rel = float(h.rel_dBc) + harm_boost
             carriers.append(LOCarrier(h.k * f_out_hz, rel, f"harm{h.k}"))
 
-        # Basic PFD families, if present.
+        # Basic PFD families, if present (with roll-off).
         fams = None
         if isinstance(mode.pfd_spurs_at_output, dict):
             fams = mode.pfd_spurs_at_output.get("families", [])
         if fams and pfd_hz and pfd_hz > 0:
             for fam in fams:
                 for comp in fam.components:
+                    k = int(comp.k)
+                    # Compute level with roll-off; place ±k*fPFD
+                    rel_k = self._apply_pfd_rolloff(comp, k, float(pfd_hz))
                     for sgn in (+1, -1):
-                        f = f_out_hz + sgn * comp.k * float(pfd_hz)
-                        carriers.append(LOCarrier(f, float(comp.base_rel_dBc), f"pfd{comp.k}"))
+                        f = f_out_hz + sgn * k * float(pfd_hz)
+                        carriers.append(LOCarrier(f, float(rel_k), f"pfd{k}"))
 
-        # Optional fractional-N boundary spur envelope (crude envelope)
+        # Optional fractional-N boundary spur envelope (simple envelope)
         env = getattr(mode, "frac_boundary_spurs", None)
         if isinstance(env, dict) and env.get("enabled", False) and pfd_hz and pfd_hz > 0:
             amp = float(env.get("amplitude_at_eps0p5_rel_dBc", -58))
+            slope = float(env.get("rolloff_slope_db_per_dec", 0.0))
+            # Always place ±0.5*fPFD
             for sgn in (+1, -1):
                 carriers.append(LOCarrier(f_out_hz + sgn * 0.5 * float(pfd_hz), amp, "frac_boundary"))
+            # Add a weaker inner pair at ±0.25*fPFD if slope provided, as a crude envelope fall-off
+            if slope > 0:
+                amp_025 = amp - slope * np.log10(2.0)  # one half-decade from 0.5 to 0.25
+                for sgn in (+1, -1):
+                    carriers.append(LOCarrier(f_out_hz + sgn * 0.25 * float(pfd_hz), float(amp_025), "frac_env"))
 
         return carriers
+
+    @lru_cache(maxsize=16384)
+    def _equiv_carriers_cached(self, f_out_hz_q: float, mode_name: str, divider: str, pfd_hz_q: float) -> tuple[LOCarrier, ...]:
+        mode = next(m for m in self.mdl.modes if m.name == mode_name)
+        lst = self._equivalent_carriers_no_cache(f_out_hz_q, mode, divider, None if pfd_hz_q <= 0 else pfd_hz_q)
+        return tuple(lst)
+
+    def equivalent_carriers(
+        self,
+        f_out_hz: float,
+        mode: Mode,
+        divider: str,
+        pfd_hz: float | None = None,
+    ) -> List[LOCarrier]:
+        """
+        Build equivalent LO carriers at the *output* (post-divider) with relative levels.
+        This variant uses an internal LRU cache keyed on (rounded f_out, mode, divider, rounded pfd_hz).
+        """
+        q = 1e3  # 1 kHz quantization is plenty
+        f_q = round(float(f_out_hz) / q) * q
+        pfd_q = 0.0 if (pfd_hz is None or pfd_hz <= 0) else (round(float(pfd_hz) / q) * q)
+        return list(self._equiv_carriers_cached(f_q, mode.name, divider, pfd_q))
 
     def _best_pad_within_drive(
         self,

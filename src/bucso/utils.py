@@ -40,20 +40,35 @@ class Band:
 
 
 def coalesce_bins(freqs: np.ndarray, levels_db: np.ndarray, bin_width_hz: float):
-    """Return (bin_centers, summed_levels_db) with simple sliding coalescing."""
-    if freqs is None or levels_db is None or len(freqs) == 0:
+    """
+    Vectorized fixed-bin coalescing to avoid order-dependent clustering.
+    Each frequency is assigned to bin index = floor(f / bin_width_hz).
+    Returns (bin_representative_freqs, summed_levels_db).
+    Deterministic & stable (mergesort on bin ids).
+    """
+    if freqs is None or levels_db is None:
         return np.array([]), np.array([])
-    order = np.argsort(freqs)
-    freqs = freqs[order]
-    levels_db = levels_db[order]
-    bins_f = [freqs[0]]
-    bins_lin = [db_to_lin(levels_db[0])]
-    last_f = freqs[0]
-    for f, L in zip(freqs[1:], levels_db[1:]):
-        if abs(f - last_f) <= bin_width_hz:
-            bins_lin[-1] += db_to_lin(L)
-        else:
-            bins_f.append(f)
-            bins_lin.append(db_to_lin(L))
-        last_f = f
-    return np.array(bins_f), np.array([lin_to_db(v) for v in bins_lin])
+    if len(freqs) == 0:
+        return np.array([]), np.array([])
+
+    freqs = np.asarray(freqs, float)
+    levels_db = np.asarray(levels_db, float)
+
+    bins = np.floor(freqs / bin_width_hz).astype(np.int64)
+    order = np.argsort(bins, kind="mergesort")
+
+    bins_s = bins[order]
+    f_s = freqs[order]
+    Llin_s = 10.0 ** (levels_db[order] / 10.0)
+
+    # indices where a new bin starts
+    start = np.empty_like(bins_s, dtype=bool)
+    start[0] = True
+    start[1:] = bins_s[1:] != bins_s[:-1]
+    idx = np.flatnonzero(start)
+
+    sums = np.add.reduceat(Llin_s, idx)
+    # representative frequency per bin: lowest frequency within the bin (stable)
+    f_rep = f_s[idx]
+
+    return f_rep, 10.0 * np.log10(sums)

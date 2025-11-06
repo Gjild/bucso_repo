@@ -187,6 +187,11 @@ def optimize(cfg_path: str, out: str = "out", models_dir: str | None = None):
     if policy.get("coverage_gaps"):
         (outp/"coverage_gaps.yaml").write_text(yaml.safe_dump(policy["coverage_gaps"], sort_keys=False), encoding="utf-8")
 
+    # NEW: IF2 windows export
+    if policy.get("if2_windows"):
+        (outp/"if2_windows.yaml").write_text(yaml.safe_dump(policy["if2_windows"], sort_keys=False), encoding="utf-8")
+        print(f"[green]Wrote unique IF2 windows to {outp/'if2_windows.yaml'}[/green]")
+
     # Runtime selector (π)
     _write_runtime_selector(outp/"runtime_selector.py", hysteresis_hz=cfg.runtime_policy.hysteresis_hz)
 
@@ -204,12 +209,14 @@ def report(policy_yaml: str, html: str = "out/summary.html"):
     <h1>{{proj.name}}</h1>
     <p>Rows: {{rows|length}} | Seed: {{meta.deterministic_seed}}</p>
     <p>Total lock: {{meta.retune_accounting.total_lock_ms}} ms | Retunes: {{meta.retune_accounting.retunes}} | Avg/step: {{meta.retune_accounting.avg_lock_ms_per_hop}} ms</p>
+    <p><strong>Note:</strong> IF2 search now uses local + global anchors; RF S21 supports CSV or YAML; S21 lookups are robust near DC.</p>
+    <p>Unique IF2 windows: {{ (policy.if2_windows or []) | length }}</p>
     <p>Input hashes:</p>
     <pre style="font-size:12px">{{ meta.file_hashes | tojson(indent=2) }}</pre>
     <table>
       <tr>
         <th>tile</th><th>IF1c</th><th>BW</th><th>RFc</th>
-        <th>LO1</th><th>LO2</th><th>IF2c</th><th>IF2BW</th><th>RF BPF</th><th>Margin (dB)</th>
+        <th>LO1</th><th>LO2</th><th>IF2c</th><th>IF2BW</th><th>RF BPF</th><th>Margin (dB)</th><th>Brittleness</th>
       </tr>
       {% for r in rows %}
       <tr>
@@ -223,11 +230,12 @@ def report(policy_yaml: str, html: str = "out/summary.html"):
         <td>{{"%.0f"%(r.if2_bw_hz/1e6)}} MHz</td>
         <td>{{r.rf_bpf_id}}</td>
         <td>{{"%.1f"%r.spur_margin_db}}</td>
+        <td>{{"%.2f"%r.brittleness_db_per_step}}</td>
       </tr>
       {% endfor %}
     </table>
     </body></html>""")
-    html_text = tpl.render(proj=policy["project"], rows=policy["rows"], meta=policy["meta"])
+    html_text = tpl.render(proj=policy["project"], rows=policy["rows"], meta=policy["meta"], policy=policy)
     Path(html).parent.mkdir(parents=True, exist_ok=True)
     Path(html).write_text(html_text, encoding="utf-8")
     print(f"[green]Wrote {html}[/green]")
@@ -259,6 +267,8 @@ rbw_binning:
   rbw_hz: 10e3
   rbw_frac_of_bw: 0.0025
   rbw_ppm_of_freq: 0
+  # NOTE: The tool computes the coalescing window as max(rbw_hz, rbw_frac_of_bw*BW, rbw_ppm_of_freq*freq).
+  #       A string expression knob (coalesce_window) from the design doc is not implemented on purpose.
 
 search:
   lo1_candidates: ["LMX2595_A.yaml"]
@@ -276,6 +286,8 @@ orders:
 constraints:
   enforce_desired_mn11_only: true
   guard_margin_db: 2.0
+  desired_stage1_sign: +1
+  desired_stage2_sign: +1
 
 early_reject:
   image_in_if2_passband: true
@@ -444,6 +456,8 @@ min_bw_hz: 500e6
 max_bw_hz: 6000e6
 center_range_hz: [500e6, 9000e6]
 search:
+  # seeds_per_tile CONTROLS IF2 SEARCH DENSITY deterministically (both center and BW seeds).
+  # Larger = broader exploration; keep modest to bound runtime.
   seeds_per_tile: 8
   local_refinement: "coordinate_descent"
   max_refine_iters: 12
