@@ -802,15 +802,19 @@ def _eval_tile(task_args) -> tuple[PlanRow | None, list[dict], dict] | None:
                                                 "rf_bw_hz": float(summ.desired_rf_band.bw_hz),
                                                 "bins": [
                                                     {
-                                                        "f_rf_hz": b.f_rf_hz,
-                                                        "combined_level_dbc": b.level_dbc,
-                                                        "inband": b.inband,
-                                                        "limit_dbc": b.info.get("limit_dbc"),
-                                                        "margin_db": b.info.get("margin_db"),
+                                                        "f_rf_hz": float(b.f_rf_hz),
+                                                        "combined_level_dbc": float(b.level_dbc),
+                                                        "inband": bool(b.inband),
+                                                        "limit_dbc": float(b.info.get("limit_dbc")),
+                                                        "margin_db": float(b.info.get("margin_db")),
+                                                        "families_present": list(b.info.get("families_present", [])),
+                                                        "has_missing_table_data": bool(b.info.get("has_missing_table_data", False)),
+                                                        "components": b.info.get("components", []),
                                                     }
                                                     for b in summ.bins
                                                 ],
                                             }
+
                                         else:
                                             # Track alternatives within Δ dB of best
                                             if best_row is not None and (best_score - score) <= float(cfg.targets.alt_within_db + 1e-9):
@@ -855,17 +859,20 @@ def _eval_tile(task_args) -> tuple[PlanRow | None, list[dict], dict] | None:
             # overwrite margin (and ledger) with full-order result
             best_row.spur_margin_db = float(summ_full.worst_margin_db)
             best_ledger = {
-                "rf_center_hz": float(summ_full.desired_rf_band.center_hz),
-                "rf_bw_hz": float(summ_full.desired_rf_band.bw_hz),
+                "rf_center_hz": float(summ.desired_rf_band.center_hz),
+                "rf_bw_hz": float(summ.desired_rf_band.bw_hz),
                 "bins": [
                     {
-                        "f_rf_hz": b.f_rf_hz,
-                        "combined_level_dbc": b.level_dbc,
-                        "inband": b.inband,
-                        "limit_dbc": b.info.get("limit_dbc"),
-                        "margin_db": b.info.get("margin_db"),
+                        "f_rf_hz": float(b.f_rf_hz),
+                        "combined_level_dbc": float(b.level_dbc),
+                        "inband": bool(b.inband),
+                        "limit_dbc": float(b.info.get("limit_dbc")),
+                        "margin_db": float(b.info.get("margin_db")),
+                        "families_present": list(b.info.get("families_present", [])),
+                        "has_missing_table_data": bool(b.info.get("has_missing_table_data", False)),
+                        "components": b.info.get("components", []),
                     }
-                    for b in summ_full.bins
+                    for b in summ.bins
                 ],
             }
 

@@ -547,7 +547,8 @@ def main() -> None:
             "out",
             "site",
             "KaBUC_SpurPlan.egg-info",
-            "tests_hide"
+            "tests_hide",
+            "out"
         ]
         uv_files = [
             "uv.lock",

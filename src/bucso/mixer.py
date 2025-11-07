@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict
+from typing import Dict, Tuple
 from functools import lru_cache
 import numpy as np
 from .models import MixerModel
@@ -108,6 +108,34 @@ class Mixer:
     def rejection_dbc(self, m: int, n: int, lo_hz: float, if_hz: float) -> float:
         q = self._q_hz
         return self._rej_cached(m, n, round(lo_hz / q) * q, round(if_hz / q) * q)
+    
+    @lru_cache(maxsize=262144)
+    def _rej_cached_meta(self, m: int, n: int, lo_q: float, if_q: float) -> Tuple[float, str]:
+        # 1) Exact scalar entry
+        for e in self._entries:
+            if e.get("m") == m and e.get("n") == n:
+                return float(e["rej_dbc"]), "scalar"
+
+        # 2) Per-(m,n) grid
+        key = f"{int(m)},{int(n)}"
+        grid = self._grids_by_order.get(key)
+        if grid and grid["rej"].size and grid["lo"].size and grid["if"].size:
+            val = _bilinear_clamped(grid["rej"], grid["lo"], grid["if"], lo_q, if_q)
+            return float(val), "grid_mn"
+
+        # 3) Legacy default grid only for (1,1)
+        if (m == 1 and n == 1) and (self._grid_default is not None):
+            gd = self._grid_default
+            if gd["rej"].size and gd["lo"].size and gd["if"].size:
+                val = _bilinear_clamped(gd["rej"], gd["lo"], gd["if"], lo_q, if_q)
+                return float(val), "grid_11_legacy"
+
+        # 4) Conservative fallback
+        return float(self.mdl.fallback_rej_dbc), "fallback"
+
+    def rejection_with_meta(self, m: int, n: int, lo_hz: float, if_hz: float) -> Tuple[float, str]:
+        q = self._q_hz
+        return self._rej_cached_meta(m, n, round(lo_hz / q) * q, round(if_hz / q) * q)
 
     def drive_derate_db(self, delivered_dbm: float) -> float:
         reqmin = self.mdl.required_lo_drive_dbm["min"]

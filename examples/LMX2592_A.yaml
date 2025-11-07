@@ -1,0 +1,36 @@
+name: "LMX2592_A"
+ref_constraints:
+  allowed_refs_hz: [10e6]
+
+freq_range_hz: [1e9, 15e9]
+step_hz: 1e6
+
+output_power_model:
+  table:
+    freq_hz: [5e9, 10e9, 20e9, 26e9]
+    p_out_dbm: [15, 15, 15, 15]
+  divider_adjust_db:
+    "/1": 0
+
+distribution:
+  path_losses_db: {lo1: 0.1}
+  pad_options_db: [0, 3, 6]
+
+modes:
+  - name: "fracN"
+    enabled: true
+    pfd_hz_range: [10e6, 200e6]
+    pfd_dividers: [1,2,4,8]
+    vco_dividers: [1,2,4,8,16]
+    lock_time_model:
+      base_ms: 0.50
+      per_mhz_ms: 0.002
+      mode_penalties_ms: {int_to_frac: 0.30, frac_to_int: 0.20}
+    harmonics_at_output:
+      - {k: 2, rel_dBc: -25}
+      - {k: 3, rel_dBc: -35}
+    pfd_spurs_at_output:
+      families: []
+
+divider_spectrum:
+  "/1": { harm_delta_dBc: 0 }

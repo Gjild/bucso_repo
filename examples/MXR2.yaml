@@ -1,0 +1,73 @@
+name: "MXR2"
+type: "double-balanced"
+if_range_hz: [1e6, 40e9]
+lo_range_hz: [10e9, 15e9]
+rf_range_hz: [10e9, 40e9]
+
+required_lo_drive_dbm: {min: 11, max: 17}
+drive_derate: {nominal_dbm: 13, slope_db_per_db: 1.0, max_derate_db: 6}
+
+spur_table:
+  entries:
+    - {m: 0, n: 1, rej_dbc: -23.51}
+    - {m: 0, n: 2, rej_dbc: -31.28}
+
+    - {m: 1, n: 0, rej_dbc: -9.41}
+    - {m: 1, n: 2, rej_dbc: -38.47}
+
+    - {m: 2, n: 0, rej_dbc: -36.49}
+    - {m: 2, n: 1, rej_dbc: -57.35}
+    - {m: 2, n: 2, rej_dbc: -50.69}
+    - {m: 2, n: 3, rej_dbc: -45.32}
+
+    - {m: 3, n: 1, rej_dbc: -35.51}
+    - {m: 3, n: 2, rej_dbc: -48.40}
+    - {m: 3, n: 3, rej_dbc: -33.25}
+    - {m: 3, n: 4, rej_dbc: -51.58}
+
+    - {m: 4, n: 2, rej_dbc: -59.68}
+    - {m: 4, n: 3, rej_dbc: -56.54}
+    - {m: 4, n: 4, rej_dbc: -57.08}
+    - {m: 4, n: 5, rej_dbc: -65.03}
+
+    - {m: 5, n: 3, rej_dbc: -64.38}
+    - {m: 5, n: 4, rej_dbc: -64.83}
+    - {m: 5, n: 5, rej_dbc: -53.19}
+    - {m: 5, n: 6, rej_dbc: -84.01}
+
+    - {m: 6, n: 4, rej_dbc: -80.49}
+    - {m: 6, n: 5, rej_dbc: -63.48}
+    - {m: 6, n: 6, rej_dbc: -71.90}
+    - {m: 6, n: 7, rej_dbc: -74.62}
+
+    - {m: 7, n: 5, rej_dbc: -82.37}
+    - {m: 7, n: 6, rej_dbc: -70.61}
+    - {m: 7, n: 7, rej_dbc: -56.58}
+    - {m: 7, n: 8, rej_dbc: -82.83}
+
+    - {m: 8, n: 6, rej_dbc: -85.58}
+    - {m: 8, n: 7, rej_dbc: -67.26}
+    - {m: 8, n: 8, rej_dbc: -77.86}
+    - {m: 8, n: 9, rej_dbc: -71.69}
+
+    - {m: 9, n: 7, rej_dbc: -82.60}
+    - {m: 9, n: 8, rej_dbc: -79.63}
+    - {m: 9, n: 9, rej_dbc: -78.17}
+    - {m: 9, n: 10, rej_dbc: -80.73}
+
+    - {m: 10, n: 8, rej_dbc: -91.13}
+    - {m: 10, n: 9, rej_dbc: -69.87}
+    - {m: 10, n: 10, rej_dbc: -91.24}
+
+  grids:
+    lo_hz: [2e9, 10e9, 20e9, 26e9]
+    if_hz: [100e6, 2e9, 6e9]
+    rej_dbc: [[-28,-30,-32], [-29,-31,-33], [-31,-33,-35], [-32,-34,-36]]
+
+isolation:
+  lo_to_rf_db: -38
+  if_to_rf_db: -55
+
+lo_family_scaling:
+  default_slope_db_per_db: 1.0
+  cap_db: 12

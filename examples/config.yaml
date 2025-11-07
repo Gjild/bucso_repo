@@ -1,0 +1,60 @@
+project:
+  name: "KaBUC-SpurPlan"
+  seed: 42
+  reference_10mhz_hz: 10000000
+
+bands:
+  if1_hz: {min: 950e6, max: 2150e6}
+  rf_hz: {min: 27.5e9, max: 31.0e9}
+  required_bandwidths_hz: [400e6]
+
+grids:
+  if1_center_step_hz: 100e6
+  rf_center_step_hz: 250e6
+  bw_grid_hz: [400e6]
+  snap_if1_rf_to_grid: true
+
+masks:
+  inband: {default_dbc: -60, table: []}
+  outofband: {default_dbc: -60, table: []}
+
+rbw_binning:
+  rbw_hz: 10e3
+  rbw_frac_of_bw: 0.0025
+  rbw_ppm_of_freq: 0
+  # NOTE: The tool computes the coalescing window as max(rbw_hz, rbw_frac_of_bw*BW, rbw_ppm_of_freq*freq).
+  #       A string expression knob (coalesce_window) from the design doc is not implemented on purpose.
+
+search:
+  lo1_candidates: ["LMX2592_A.yaml"]
+  lo2_candidates: ["LMX2595_A.yaml"]
+  mixer1_candidates: ["MXR1.yaml"]
+  mixer2_candidates: ["MXR2.yaml"]
+  rf_bpf_choices: ["RF_S21_28to31GHz.csv"]
+  if2_filter_model: "IF2_Model_01.yaml"
+
+orders:
+  m1n1_max_abs: 3
+  m2n2_max_abs: 3
+  cross_stage_sum_max: 6
+
+constraints:
+  enforce_desired_mn11_only: true
+  guard_margin_db: 2.0
+  desired_stage1_sign: +1
+  desired_stage2_sign: +1
+
+early_reject:
+  image_in_if2_passband: true
+  loft_in_if2_or_rf_passbands: true
+  rf_first_order_image_in_passband: true
+
+runtime_policy:
+  hysteresis_hz: 10e6
+  prefer_fewer_retunes: true
+  lock_time_penalty_weight: 1.0
+  markov_transition_matrix_csv: null
+
+targets:
+  min_margin_db: 0
+  alt_within_db: 3.0

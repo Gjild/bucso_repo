@@ -18,8 +18,11 @@ dependencies = [
   "pytest>=8.4.2",
 ]
 
+[tool.uv]
+package = true
+
 [project.scripts]
-bucso = "bucso.cli:app"
+bucso_run = "bucso.cli:app"
 
 [tool.pytest.ini_options]
 addopts = "-q"

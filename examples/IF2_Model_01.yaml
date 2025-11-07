@@ -1,0 +1,15 @@
+name: "IF2_Model_01"
+type: "symmetric_powerlaw"
+passband_il_db: 1.0
+stop_floor_db: -80.0
+rolloff_db_per_dec: 40.0
+min_bw_hz: 600e6
+max_bw_hz: 2000e6
+center_range_hz: [5e9, 17.5e9]
+search:
+  # seeds_per_tile CONTROLS IF2 SEARCH DENSITY deterministically (both center and BW seeds).
+  # Larger = broader exploration; keep modest to bound runtime.
+  seeds_per_tile: 8
+  local_refinement: "coordinate_descent"
+  max_refine_iters: 12
+  bounds_guard_hz: 0.0

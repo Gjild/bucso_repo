@@ -84,199 +84,270 @@ def enumerate_spurs(
     rf_bw_override_hz: Optional[float] = None,
 ) -> TileSummary:
     """
-    Main spur enumeration with band-affine widths:
-      - LO family carriers + order-aware family scaling (both stages)
-      - Stage-1 specials (LO1 feedthrough, IF1 leakage) propagated through Stage-2
-      - LO2 feedthroughs (fundamental + harmonics) at RF
-      - Skips the *desired* mechanism from being counted as a spur
-      - Supports flat/tabled masks
-      - Correct ± signs on IF terms in both stages
-      - Optional rf_center/bw override to assess robustness to RF-request perturbations
-      - OOB evaluation uses cfg RF band (S21 extrapolation allowed)
-      - **Band-affine ΔA**: uses worst-of-edges attenuation deltas for conservative scoring
-    """
-    # Desired bands
-    if2_des, rf_des_nom = desired_paths(tile_if1, lo1_sol.f_out_hz, lo2_sol.f_out_hz, inj1_sign, s2_sign)
+    Spur enumeration with full provenance per mechanism and component-aware RBW coalescing.
 
-    # Optional override for mask/inband reference (robustness sweeps)
-    rf_des = rf_des_nom
-    if rf_center_override_hz is not None:
-        rf_des = Band(center_hz=float(rf_center_override_hz), bw_hz=rf_bw_override_hz or rf_des_nom.bw_hz)
+    For every RF bin we now store:
+      - combined level (dBc)
+      - inband flag, mask limit, final margin
+      - components[]: each with family, per-stage orders, LO carrier tags, filter deltas,
+                      mixer rejection sources (scalar / grid_mn / grid_11_legacy / fallback)
+      - summary flags: families_present[], has_missing_table_data (any fallback), etc. (in info)
+    """
+    # Desired bands (with optional RF override for robustness)
+    if2_des, rf_des_nom = desired_paths(tile_if1, lo1_sol.f_out_hz, lo2_sol.f_out_hz, inj1_sign, s2_sign)
+    rf_des = rf_des_nom if rf_center_override_hz is None else Band(float(rf_center_override_hz), rf_bw_override_hz or rf_des_nom.bw_hz)
 
     # RBW bin width
     bin_w = rbw_width(cfg.rbw_binning, rf_des.bw_hz, rf_des.center_hz)
 
-    # Bind hot callables
+    # Hot callables
     rf_attn = rf_filter.attn_at
     if2_attn = if2win.attn_at
-    rej1 = mix1.rejection_dbc
-    der1 = mix1.drive_derate_db
-    rej2 = mix2.rejection_dbc
-    der2 = mix2.drive_derate_db
-    fam1 = mix1.family_scale_db
-    fam2 = mix2.family_scale_db
-
     rf_attn_des = float(rf_attn(rf_des.center_hz))
     if2_attn_des = float(if2_attn(if2_des.center_hz))
 
-    # RF span guard (use config RF band; S21 extrapolates beyond file)
+    # RF span guard
     rf_lo = float(cfg.bands.rf_hz.min)
     rf_hi = float(cfg.bands.rf_hz.max)
 
-    freq_list: list[float] = []
-    level_list: list[float] = []
-
-    def worst_delta(attn_func, center: float, half_width: float, des_attn: float) -> float:
-        """
-        Conservative ΔA: worst (largest) attenuation at the two band edges minus desired attenuation.
-        """
+    # Conservative ΔA helper
+    def worst_delta(attn_func, center_raw: float, half_width: float, des_attn: float) -> float:
         if half_width <= 0:
-            return float(attn_func(abs(center))) - des_attn
-        a_lo = float(attn_func(abs(center - half_width)))
-        a_hi = float(attn_func(abs(center + half_width)))
+            return float(attn_func(abs(center_raw))) - des_attn
+        a_lo = float(attn_func(abs(center_raw - half_width)))
+        a_hi = float(attn_func(abs(center_raw + half_width)))
         return max(a_lo, a_hi) - des_attn
 
-    # Stage-1 spur indices (exclude n1=0 per model; treat images via signs)
+    # Collect raw mechanisms before binning
+    # Each element: (f_rf_abs, level_dbc, component_dict)
+    mechanisms: list[tuple[float, float, dict]] = []
+
+    # --- Stage-1 × Stage-2 mixing families -----------------------------------
     m1s = [m for m in range(-cfg.orders.m1n1_max_abs, cfg.orders.m1n1_max_abs + 1) if m != 0]
     n1s = range(1, cfg.orders.m1n1_max_abs + 1)
+    m2s = [m for m in range(-cfg.orders.m2n2_max_abs, cfg.orders.m2n2_max_abs + 1) if m != 0]
+    n2s = range(1, cfg.orders.m2n2_max_abs + 1)
 
     for m1 in m1s:
         for n1 in n1s:
-            base_L1 = rej1(m1, n1, lo1_sol.f_out_hz, tile_if1.center_hz) + der1(lo1_sol.delivered_dbm)
+            rej1_nom, src1 = mix1.rejection_with_meta(m1, n1, lo1_sol.f_out_hz, tile_if1.center_hz)
+            base_L1 = rej1_nom + mix1.drive_derate_db(lo1_sol.delivered_dbm)
             for c1 in carriers_lo1:
-                for sgn1 in (+1, -1):  # include ± on IF1 term
-                    # Stage-1 band parameters
-                    f_if2_c_raw = m1 * c1.freq_hz + sgn1 * n1 * tile_if1.center_hz
-                    f_if2_c = abs(f_if2_c_raw)
+                fam1_term = mix1.family_scale_db(abs(m1), c1.rel_dBc)
+                for sgn1 in (+1, -1):  # sign on IF1 term
+                    f_if2_raw = m1 * c1.freq_hz + sgn1 * n1 * tile_if1.center_hz
+                    f_if2_c = abs(f_if2_raw)
                     w_if2 = abs(n1) * (tile_if1.bw_hz * 0.5)
+                    dA_if2 = float(worst_delta(if2_attn, f_if2_raw, w_if2, if2_attn_des))
+                    L1_eff = base_L1 + fam1_term
 
-                    # ΔA at IF2: worst of the edges minus desired
-                    dA_if2 = float(worst_delta(if2_attn, f_if2_c_raw, w_if2, if2_attn_des))
-                    # Family scaling (order-aware, capped)
-                    L1 = base_L1 + fam1(abs(m1), c1.rel_dBc)
-
-                    for m2 in range(-cfg.orders.m2n2_max_abs, cfg.orders.m2n2_max_abs + 1):
-                        if m2 == 0:
-                            continue
-                        for n2 in range(1, cfg.orders.m2n2_max_abs + 1):
-                            if abs(m1) + abs(n1) + abs(m2) + abs(n2) > cfg.orders.cross_stage_sum_max:
+                    for m2 in m2s:
+                        for n2 in n2s:
+                            if (abs(m1) + abs(n1) + abs(m2) + abs(n2)) > cfg.orders.cross_stage_sum_max:
                                 continue
 
-                            base_L2 = rej2(m2, n2, lo2_sol.f_out_hz, f_if2_c) + der2(lo2_sol.delivered_dbm)
+                            rej2_nom, src2 = mix2.rejection_with_meta(m2, n2, lo2_sol.f_out_hz, f_if2_c)
+                            base_L2 = rej2_nom + mix2.drive_derate_db(lo2_sol.delivered_dbm)
                             for c2 in carriers_lo2:
-                                for sgn2 in (+1, -1):  # include ± on IF2 term for stage-2
-                                    L2 = base_L2 + fam2(abs(m2), c2.rel_dBc)
-                                    # Stage-2 band parameters
-                                    f_rf_c_raw = m2 * c2.freq_hz + sgn2 * n2 * f_if2_c_raw
-                                    f_rf_c = abs(f_rf_c_raw)
-                                    w_rf = abs(n2) * w_if2
-
-                                    # Skip outside a padded RF span for speed
-                                    if (f_rf_c < rf_lo - 2 * bin_w) or (f_rf_c > rf_hi + 2 * bin_w):
+                                fam2_term = mix2.family_scale_db(abs(m2), c2.rel_dBc)
+                                for sgn2 in (+1, -1):
+                                    f_rf_raw = m2 * c2.freq_hz + sgn2 * n2 * f_if2_raw
+                                    f_rf = abs(f_rf_raw)
+                                    if (f_rf < rf_lo - 2 * bin_w) or (f_rf > rf_hi + 2 * bin_w):
                                         continue
 
-                                    # *** Skip the exact desired mechanism counted as spur ***
-                                    # This covers all first-order products that land on the desired frequency.
+                                    # Skip exact desired first-order (m,n)=(±1,1) on main carriers inside the desired bin
                                     if (
-                                        (abs(m1) == 1)
-                                        and (n1 == 1)
-                                        and (c1.tag == "main")
-                                        and (abs(m2) == 1)
-                                        and (n2 == 1)
-                                        and (c2.tag == "main")
-                                        and (abs(f_rf_c - rf_des_nom.center_hz) <= bin_w * 0.5)
+                                        (abs(m1) == 1) and (n1 == 1) and (c1.tag == "main") and
+                                        (abs(m2) == 1) and (n2 == 1) and (c2.tag == "main") and
+                                        (abs(f_rf - rf_des_nom.center_hz) <= bin_w * 0.5)
                                     ):
                                         continue
 
-                                    # ΔA at RF: worst-of-edges minus desired
-                                    dA_rf = float(worst_delta(rf_attn, f_rf_c_raw, w_rf, rf_attn_des))
+                                    dA_rf = float(worst_delta(rf_attn, f_rf_raw, abs(n2) * w_if2, rf_attn_des))
+                                    L_total = L1_eff + dA_if2 + (base_L2 + fam2_term) + dA_rf
 
-                                    freq_list.append(f_rf_c)
-                                    level_list.append(L1 + dA_if2 + L2 + dA_rf)
+                                    comp = {
+                                        "family": "mixing",
+                                        "stage1": {
+                                            "m": m1, "n": n1, "sign_if": sgn1,
+                                            "lo1_carrier_tag": c1.tag, "lo1_rel_dBc": float(c1.rel_dBc),
+                                            "rej_dbc": float(rej1_nom), "rej_source": src1,
+                                            "drive_derate_db": float(mix1.drive_derate_db(lo1_sol.delivered_dbm)),
+                                            "family_scale_db": float(fam1_term),
+                                        },
+                                        "stage2": {
+                                            "m": m2, "n": n2, "sign_if": sgn2,
+                                            "lo2_carrier_tag": c2.tag, "lo2_rel_dBc": float(c2.rel_dBc),
+                                            "rej_dbc": float(rej2_nom), "rej_source": src2,
+                                            "drive_derate_db": float(mix2.drive_derate_db(lo2_sol.delivered_dbm)),
+                                            "family_scale_db": float(fam2_term),
+                                        },
+                                        "dA_if2_db": float(dA_if2),
+                                        "dA_rf_db": float(dA_rf),
+                                        "f_rf_hz_raw": float(f_rf_raw),
+                                        "f_if2_hz_raw": float(f_if2_raw),
+                                    }
+                                    mechanisms.append((f_rf, float(L_total), comp))
 
-    # Stage-1 specials at IF2 output → propagate through Stage-2
-    # LO1 feedthrough at IF2 out (treat as a tone; no band)
+    # --- Stage-1 specials propagated ------------------------------------------------
+    # LO1 feedthrough at IF2 output
     f_lo1 = lo1_sol.f_out_hz
-    L_lo1_if2 = mix1.mdl.isolation.lo_to_rf_db + (float(if2_attn(f_lo1)) - if2_attn_des)
-    for m2 in range(-cfg.orders.m2n2_max_abs, cfg.orders.m2n2_max_abs + 1):
-        if m2 == 0:
-            continue
-        for n2 in range(1, cfg.orders.m2n2_max_abs + 1):
-            if abs(m2) + n2 > cfg.orders.cross_stage_sum_max:
+    dA_if2_lo = float(if2_attn(f_lo1) - if2_attn_des)
+    L_lo1_if2 = mix1.mdl.isolation.lo_to_rf_db + dA_if2_lo
+    for m2 in m2s:
+        for n2 in n2s:
+            if (abs(m2) + n2) > cfg.orders.cross_stage_sum_max:
                 continue
-            base_L2 = rej2(m2, n2, lo2_sol.f_out_hz, f_lo1) + der2(lo2_sol.delivered_dbm)
+            rej2_nom, src2 = mix2.rejection_with_meta(m2, n2, lo2_sol.f_out_hz, f_lo1)
+            base_L2 = rej2_nom + mix2.drive_derate_db(lo2_sol.delivered_dbm)
             for c2 in carriers_lo2:
+                fam2_term = mix2.family_scale_db(abs(m2), c2.rel_dBc)
                 for sgn2 in (+1, -1):
-                    L2 = base_L2 + fam2(abs(m2), c2.rel_dBc)
-                    f_rf = abs(m2 * c2.freq_hz + sgn2 * n2 * (+f_lo1))
+                    f_rf_raw = m2 * c2.freq_hz + sgn2 * n2 * (+f_lo1)
+                    f_rf = abs(f_rf_raw)
                     if (f_rf < rf_lo - 2 * bin_w) or (f_rf > rf_hi + 2 * bin_w):
                         continue
                     dA_rf = float(rf_attn(f_rf) - rf_attn_des)
-                    freq_list.append(f_rf)
-                    level_list.append(L_lo1_if2 + L2 + dA_rf)
+                    L_total = L_lo1_if2 + base_L2 + fam2_term + dA_rf
+                    comp = {
+                        "family": "lo1_feedthrough",
+                        "stage2": {
+                            "m": m2, "n": n2, "sign_if": sgn2,
+                            "lo2_carrier_tag": c2.tag, "lo2_rel_dBc": float(c2.rel_dBc),
+                            "rej_dbc": float(rej2_nom), "rej_source": src2,
+                            "drive_derate_db": float(mix2.drive_derate_db(lo2_sol.delivered_dbm)),
+                            "family_scale_db": float(fam2_term),
+                        },
+                        "lo1": {"freq_hz": float(f_lo1), "isolation_db": float(mix1.mdl.isolation.lo_to_rf_db)},
+                        "dA_if2_db": float(dA_if2_lo),
+                        "dA_rf_db": float(dA_rf),
+                        "f_rf_hz_raw": float(f_rf_raw),
+                    }
+                    mechanisms.append((f_rf, float(L_total), comp))
 
-    # IF1 leakage at IF2 out (center only)
-    f_if1 = tile_if1.center_hz
-    L_if1_if2 = mix1.mdl.isolation.if_to_rf_db + (float(if2_attn(f_if1)) - if2_attn_des)
-    for m2 in range(-cfg.orders.m2n2_max_abs, cfg.orders.m2n2_max_abs + 1):
-        if m2 == 0:
-            continue
-        for n2 in range(1, cfg.orders.m2n2_max_abs + 1):
-            if abs(m2) + n2 > cfg.orders.cross_stage_sum_max:
+    # IF1 leakage at IF2 output
+    f_if1c = tile_if1.center_hz
+    dA_if2_if = float(if2_attn(f_if1c) - if2_attn_des)
+    L_if1_if2 = mix1.mdl.isolation.if_to_rf_db + dA_if2_if
+    for m2 in m2s:
+        for n2 in n2s:
+            if (abs(m2) + n2) > cfg.orders.cross_stage_sum_max:
                 continue
-            base_L2 = rej2(m2, n2, lo2_sol.f_out_hz, f_if1) + der2(lo2_sol.delivered_dbm)
+            rej2_nom, src2 = mix2.rejection_with_meta(m2, n2, lo2_sol.f_out_hz, f_if1c)
+            base_L2 = rej2_nom + mix2.drive_derate_db(lo2_sol.delivered_dbm)
             for c2 in carriers_lo2:
+                fam2_term = mix2.family_scale_db(abs(m2), c2.rel_dBc)
                 for sgn2 in (+1, -1):
-                    L2 = base_L2 + fam2(abs(m2), c2.rel_dBc)
-                    f_rf = abs(m2 * c2.freq_hz + sgn2 * n2 * (+f_if1))
+                    f_rf_raw = m2 * c2.freq_hz + sgn2 * n2 * (+f_if1c)
+                    f_rf = abs(f_rf_raw)
                     if (f_rf < rf_lo - 2 * bin_w) or (f_rf > rf_hi + 2 * bin_w):
                         continue
                     dA_rf = float(rf_attn(f_rf) - rf_attn_des)
-                    freq_list.append(f_rf)
-                    level_list.append(L_if1_if2 + L2 + dA_rf)
+                    L_total = L_if1_if2 + base_L2 + fam2_term + dA_rf
+                    comp = {
+                        "family": "if1_leakage",
+                        "stage2": {
+                            "m": m2, "n": n2, "sign_if": sgn2,
+                            "lo2_carrier_tag": c2.tag, "lo2_rel_dBc": float(c2.rel_dBc),
+                            "rej_dbc": float(rej2_nom), "rej_source": src2,
+                            "drive_derate_db": float(mix2.drive_derate_db(lo2_sol.delivered_dbm)),
+                            "family_scale_db": float(fam2_term),
+                        },
+                        "if1": {"center_hz": float(f_if1c), "isolation_db": float(mix1.mdl.isolation.if_to_rf_db)},
+                        "dA_if2_db": float(dA_if2_if),
+                        "dA_rf_db": float(dA_rf),
+                        "f_rf_hz_raw": float(f_rf_raw),
+                    }
+                    mechanisms.append((f_rf, float(L_total), comp))
 
-    # LO2 feedthroughs at RF: include main + harmonics (use isolation plus carrier rel_dBc)
+    # LO2 feedthroughs at RF (main + harmonics/PFD/boundary carriers)
     for c2 in carriers_lo2:
-        f = c2.freq_hz
-        # FIX: The aggressive OOB filter is removed here to ensure critical LO feedthrough spurs are always evaluated.
-        # This has negligible performance impact as the loop is very small.
-        L = mix2.mdl.isolation.lo_to_rf_db + c2.rel_dBc + (float(rf_attn(f)) - rf_attn_des)
-        freq_list.append(f)
-        level_list.append(L)
+        f = float(c2.freq_hz)
+        dA_rf = float(rf_attn(f) - rf_attn_des)
+        L = float(mix2.mdl.isolation.lo_to_rf_db) + float(c2.rel_dBc) + dA_rf
+        comp = {
+            "family": "lo2_feedthrough",
+            "lo2_carrier_tag": c2.tag,
+            "lo2_rel_dBc": float(c2.rel_dBc),
+            "lo2_freq_hz": f,
+            "isolation_db": float(mix2.mdl.isolation.lo_to_rf_db),
+            "dA_rf_db": float(dA_rf),
+        }
+        mechanisms.append((f, L, comp))
 
-    # Coalesce by RBW fixed bins
-    freqs = np.asarray(freq_list, dtype=float)
-    levs = np.asarray(level_list, dtype=float)
-    cf, cL = coalesce_bins(freqs, levs, bin_w)
+    # ---- Component-aware coalescing into RBW bins -----------------------------
+    if not mechanisms:
+        return TileSummary(worst_margin_db=-999.0, bins=[], desired_rf_band=rf_des)
 
-    # In-band classification & limits
+    # deterministic sort
+    mechanisms.sort(key=lambda t: t[0])
+
+    bins_freq: list[float] = []
+    bins_pow: list[float] = []      # linear power sum
+    bins_components: list[list[dict]] = []
+
+    def db_to_lin(db): return 10.0 ** (db / 10.0)
+    def lin_to_db(lin): return -999.0 if lin <= 0 else 10.0 * np.log10(lin)
+
+    current_center = mechanisms[0][0]
+    current_lin = 0.0
+    current_comps: list[dict] = []
+
+    def flush():
+        if current_comps:
+            bins_freq.append(current_center)
+            bins_pow.append(current_lin)
+            bins_components.append(list(current_comps))
+
+    for f, L, comp in mechanisms:
+        if abs(f - current_center) <= (bin_w * 0.5):
+            current_lin += db_to_lin(L)
+            current_comps.append(comp)
+        else:
+            flush()
+            current_center = f
+            current_lin = db_to_lin(L)
+            current_comps = [comp]
+    flush()
+
+    cf = np.asarray(bins_freq, float)
+    cL = np.asarray([lin_to_db(p) for p in bins_pow], float)
+
+    # In-band classification & limits (unchanged math)
     inband_mask = np.abs(cf - rf_des.center_hz) <= (rf_des.bw_hz / 2.0 + bin_w / 2.0)
-
-    # Edge-relative offsets (>=0 inside band is 0); outside is distance to nearest edge
     edge = rf_des.bw_hz / 2.0
     dist_from_edge = np.clip(np.abs(cf - rf_des.center_hz) - edge, 0.0, None)
 
-    # In-band limits (flat or table vs offset-from-edge = 0 inside)
-    lim_in = _interp_mask_flat_or_table(
-        cfg.masks.inband.default_dbc, cfg.masks.inband.table, dist_from_edge
-    )
+    # Inband mask
+    lim_in = _interp_mask_flat_or_table(cfg.masks.inband.default_dbc, cfg.masks.inband.table, dist_from_edge)
 
-    # Out-of-band limits: absolute or edge_relative, per config
+    # OOB mask
     if (getattr(cfg.masks.outofband, "mode", "absolute") == "edge_relative"):
-        oob_arg = dist_from_edge  # distance from band edge
+        oob_arg = dist_from_edge
     else:
-        oob_arg = cf  # absolute frequency
-    lim_oob = _interp_mask_flat_or_table(
-        cfg.masks.outofband.default_dbc, cfg.masks.outofband.table, oob_arg
-    )
+        oob_arg = cf
+    lim_oob = _interp_mask_flat_or_table(cfg.masks.outofband.default_dbc, cfg.masks.outofband.table, oob_arg)
 
     limits = np.where(inband_mask, lim_in, lim_oob).astype(float)
     margins = limits - cL - cfg.constraints.guard_margin_db
     worst = float(np.min(margins)) if margins.size else -999.0
 
-    final_bins: list[BinEntry] = [
-        BinEntry(float(f), float(L), bool(inb), {"limit_dbc": float(lim), "margin_db": float(mar)})
-        for f, L, inb, lim, mar in zip(cf, cL, inband_mask, limits, margins)
-    ]
+    final_bins: list[BinEntry] = []
+    for f, Ldb, inb, lim, mar, comps in zip(cf, cL, inband_mask, limits, margins, bins_components):
+        families = sorted({c.get("family", "mixing") for c in comps})
+        has_fallback = any(
+            (c.get("stage1", {}).get("rej_source") == "fallback") or
+            (c.get("stage2", {}).get("rej_source") == "fallback")
+            for c in comps
+        )
+        info = {
+            "limit_dbc": float(lim),
+            "margin_db": float(mar),
+            "components": comps,                 # <-- full provenance
+            "families_present": families,
+            "has_missing_table_data": bool(has_fallback),
+        }
+        final_bins.append(BinEntry(float(f), float(Ldb), bool(inb), info))
 
     return TileSummary(worst_margin_db=worst, bins=final_bins, desired_rf_band=rf_des)
