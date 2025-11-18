@@ -39,6 +39,12 @@ class Mixer:
       - optional per-(m,n) grids (grids_by_order: {"m,n": {lo_hz, if_hz, rej_dbc}})
       - optional legacy single grid assumed to be (1,1)
       - configurable fallback for unknown orders
+      - Optional sign symmetry in m and/or n:
+          spur_table.symmetric_m: bool  # if true, m is folded to |m|
+          spur_table.symmetric_n: bool  # if true, n is folded to |n|
+        If not explicitly set, we infer:
+          - symmetric_m = True if all table/grid m ≥ 0
+          - symmetric_n = True if all table/grid n ≥ 0
     Also provides simple drive-derate and order-aware LO family scaling.
     """
 
@@ -46,8 +52,13 @@ class Mixer:
         self.mdl = mdl
 
         st: Dict[str, object] = mdl.spur_table or {}
+        
+        # --- Sign symmetry config -----------------------
+        sym_m = st.get("symmetric_m", None)
+        sym_n = st.get("symmetric_n", None)
+        self._symmetric_m: bool | None = bool(sym_m) if sym_m is not None else None
+        self._symmetric_n: bool | None = bool(sym_n) if sym_n is not None else None
 
-        # New: per-(m,n) grids
         self._grids_by_order: Dict[str, Dict[str, np.ndarray]] = {}
         if "grids_by_order" in st and isinstance(st["grids_by_order"], dict):
             for key, g in st["grids_by_order"].items():
@@ -82,9 +93,25 @@ class Mixer:
 
     def clear_cache(self):
         self._rej_cached.cache_clear()
+        
+    def _canonical_mn(self, m: int, n: int) -> Tuple[int, int]:
+        """
+        Apply sign-symmetry folding for lookup, if enabled.
+
+        If symmetric_m is True, we treat (m, n) and (-m, n) as the same row.
+        If symmetric_n is True, we treat (m, n) and (m, -n) as the same row.
+        """
+        if self._symmetric_m:
+            m = abs(int(m))
+        if self._symmetric_n:
+            n = abs(int(n))
+        return int(m), int(n)
 
     @lru_cache(maxsize=262144)
     def _rej_cached(self, m: int, n: int, lo_q: float, if_q: float) -> float:
+        # Apply symmetry folding first
+        m, n = self._canonical_mn(m, n)
+
         # 1) Exact scalar entry wins
         for e in self._entries:
             if e.get("m") == m and e.get("n") == n:
@@ -111,6 +138,9 @@ class Mixer:
     
     @lru_cache(maxsize=262144)
     def _rej_cached_meta(self, m: int, n: int, lo_q: float, if_q: float) -> Tuple[float, str]:
+        # Apply symmetry folding first
+        m, n = self._canonical_mn(m, n)
+
         # 1) Exact scalar entry
         for e in self._entries:
             if e.get("m") == m and e.get("n") == n:

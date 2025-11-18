@@ -1,0 +1,60 @@
+name: "MXR1"
+type: "double-balanced"
+if_range_hz: [0.5e9, 9e9]
+lo_range_hz: [1e9, 20e9]
+rf_range_hz: [3e9, 20e9]
+
+required_lo_drive_dbm: {min: -6, max: 6}
+drive_derate: {nominal_dbm: 13, slope_db_per_db: 1.0, max_derate_db: 6}
+
+spur_table:
+  symmetric_m: true   # treat ±m the same
+  symmetric_n: true   # treat ±n the same (future-proofing)
+  entries:
+  # m positive n positive
+    - {m: 0, n: 1, rej_dbc: -24}
+    - {m: 0, n: 2, rej_dbc: -15}
+    - {m: 0, n: 3, rej_dbc: -16}
+    - {m: 0, n: 4, rej_dbc: -20}
+
+    - {m: 1, n: 0, rej_dbc: -51}
+    - {m: 1, n: 2, rej_dbc: -142}
+    - {m: 1, n: 3, rej_dbc: -13}
+    - {m: 1, n: 4, rej_dbc: -43}
+
+    - {m: 2, n: 0, rej_dbc: -58}
+    - {m: 2, n: 1, rej_dbc: -64}
+    - {m: 2, n: 2, rej_dbc: -58}
+    - {m: 2, n: 3, rej_dbc: -61}
+    - {m: 2, n: 4, rej_dbc: -62}
+
+    - {m: 3, n: 0, rej_dbc: -75}
+    - {m: 3, n: 1, rej_dbc: -72}
+    - {m: 3, n: 2, rej_dbc: -72}
+    - {m: 3, n: 3, rej_dbc: -71}
+    - {m: 3, n: 4, rej_dbc: -69.420} # Not real
+
+    - {m: 4, n: 0, rej_dbc: -75}
+    - {m: 4, n: 1, rej_dbc: -75}
+    - {m: 4, n: 2, rej_dbc: -73}
+    - {m: 4, n: 3, rej_dbc: -73}
+    - {m: 4, n: 4, rej_dbc: -69.420} # Not real
+
+    - {m: 5, n: 0, rej_dbc: -75}
+    - {m: 5, n: 1, rej_dbc: -73}
+    - {m: 5, n: 2, rej_dbc: -73}
+    - {m: 5, n: 3, rej_dbc: -69.420} # Not real
+    - {m: 5, n: 4, rej_dbc: -69.420} # Not real
+
+  grids:
+    #lo_hz: [500e6, 2e9, 6e9, 12e9]
+    #if_hz: [100e6, 500e6, 1e9]
+    #rej_dbc: [[-32,-34,-36], [-33,-35,-37], [-35,-37,-40], [-36,-38,-42]]
+
+isolation:
+  lo_to_rf_db: -23
+  if_to_rf_db: -40
+
+lo_family_scaling:
+  default_slope_db_per_db: 1.0
+  cap_db: 12

@@ -9,7 +9,7 @@ center_range_hz: [5e9, 17.5e9]
 search:
   # seeds_per_tile CONTROLS IF2 SEARCH DENSITY deterministically (both center and BW seeds).
   # Larger = broader exploration; keep modest to bound runtime.
-  seeds_per_tile: 8
+  seeds_per_tile: 10
   local_refinement: "coordinate_descent"
-  max_refine_iters: 12
+  max_refine_iters: 15
   bounds_guard_hz: 0.0

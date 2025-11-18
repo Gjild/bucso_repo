@@ -8,28 +8,42 @@ required_lo_drive_dbm: {min: 11, max: 17}
 drive_derate: {nominal_dbm: 13, slope_db_per_db: 1.0, max_derate_db: 6}
 
 spur_table:
+  symmetric_m: true   # treat ±m the same
+  symmetric_n: true   # treat ±n the same (future-proofing)
   entries:
+  # m positive, n positive
     - {m: 0, n: 1, rej_dbc: -23.51}
     - {m: 0, n: 2, rej_dbc: -31.28}
+    - {m: 0, n: 3, rej_dbc: -69.420} # Not real
+    - {m: 0, n: 4, rej_dbc: -69.420} # Not real
 
     - {m: 1, n: 0, rej_dbc: -9.41}
     - {m: 1, n: 2, rej_dbc: -38.47}
+    - {m: 1, n: 3, rej_dbc: -69.420} # Not real
+    - {m: 1, n: 4, rej_dbc: -69.420} # Not real
 
     - {m: 2, n: 0, rej_dbc: -36.49}
     - {m: 2, n: 1, rej_dbc: -57.35}
     - {m: 2, n: 2, rej_dbc: -50.69}
     - {m: 2, n: 3, rej_dbc: -45.32}
+    - {m: 2, n: 4, rej_dbc: -69.420} # Not real
 
+    - {m: 3, n: 0, rej_dbc: -69.420} # Not real
     - {m: 3, n: 1, rej_dbc: -35.51}
     - {m: 3, n: 2, rej_dbc: -48.40}
     - {m: 3, n: 3, rej_dbc: -33.25}
     - {m: 3, n: 4, rej_dbc: -51.58}
 
+    - {m: 4, n: 0, rej_dbc: -69.420} # Not real
+    - {m: 4, n: 1, rej_dbc: -69.420} # Not real
     - {m: 4, n: 2, rej_dbc: -59.68}
     - {m: 4, n: 3, rej_dbc: -56.54}
     - {m: 4, n: 4, rej_dbc: -57.08}
     - {m: 4, n: 5, rej_dbc: -65.03}
 
+    - {m: 5, n: 0, rej_dbc: -69.420} # Not real
+    - {m: 5, n: 1, rej_dbc: -69.420} # Not real
+    - {m: 5, n: 2, rej_dbc: -69.420} # Not real
     - {m: 5, n: 3, rej_dbc: -64.38}
     - {m: 5, n: 4, rej_dbc: -64.83}
     - {m: 5, n: 5, rej_dbc: -53.19}
@@ -60,9 +74,9 @@ spur_table:
     - {m: 10, n: 10, rej_dbc: -91.24}
 
   grids:
-    lo_hz: [2e9, 10e9, 20e9, 26e9]
-    if_hz: [100e6, 2e9, 6e9]
-    rej_dbc: [[-28,-30,-32], [-29,-31,-33], [-31,-33,-35], [-32,-34,-36]]
+    #lo_hz: [2e9, 10e9, 20e9, 26e9]
+    #if_hz: [100e6, 2e9, 6e9]
+    #rej_dbc: [[-28,-30,-32], [-29,-31,-33], [-31,-33,-35], [-32,-34,-36]]
 
 isolation:
   lo_to_rf_db: -38

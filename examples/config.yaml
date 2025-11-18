@@ -28,15 +28,15 @@ rbw_binning:
 search:
   lo1_candidates: ["LMX2592_A.yaml"]
   lo2_candidates: ["LMX2595_A.yaml"]
-  mixer1_candidates: ["MXR1.yaml"]
-  mixer2_candidates: ["MXR2.yaml"]
+  mixer1_candidates: ["MXR1_LTC5553.yaml"]
+  mixer2_candidates: ["MXR2_MDB44H.yaml"]
   rf_bpf_choices: ["RF_S21_28to31GHz.csv"]
   if2_filter_model: "IF2_Model_01.yaml"
 
 orders:
-  m1n1_max_abs: 3
-  m2n2_max_abs: 3
-  cross_stage_sum_max: 6
+  m1n1_max_abs: 4
+  m2n2_max_abs: 4
+  cross_stage_sum_max: 8
 
 constraints:
   enforce_desired_mn11_only: true
